@@ -18,24 +18,31 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.rpc.RpcService;
 
-import javax.annotation.Nonnull;
+import java.util.Collection;
 
-/**
- * {@link DispatcherFactory} which creates a {@link StandaloneDispatcher}.
- */
-public enum SessionDispatcherFactory implements DispatcherFactory<Dispatcher> {
-	INSTANCE;
+/** {@link DispatcherFactory} which creates a {@link StandaloneDispatcher}. */
+public enum SessionDispatcherFactory implements DispatcherFactory {
+    INSTANCE;
 
-	@Override
-	public Dispatcher createDispatcher(
-			@Nonnull RpcService rpcService,
-			@Nonnull PartialDispatcherServices partialDispatcherServices) throws Exception {
-		// create the default dispatcher
-		return new StandaloneDispatcher(
-			rpcService,
-			getEndpointId(),
-			DispatcherServices.from(partialDispatcherServices, DefaultJobManagerRunnerFactory.INSTANCE));
-	}
+    @Override
+    public StandaloneDispatcher createDispatcher(
+            RpcService rpcService,
+            DispatcherId fencingToken,
+            Collection<JobGraph> recoveredJobs,
+            DispatcherBootstrapFactory dispatcherBootstrapFactory,
+            PartialDispatcherServicesWithJobGraphStore partialDispatcherServicesWithJobGraphStore)
+            throws Exception {
+        // create the default dispatcher
+        return new StandaloneDispatcher(
+                rpcService,
+                fencingToken,
+                recoveredJobs,
+                dispatcherBootstrapFactory,
+                DispatcherServices.from(
+                        partialDispatcherServicesWithJobGraphStore,
+                        DefaultJobManagerRunnerFactory.INSTANCE));
+    }
 }

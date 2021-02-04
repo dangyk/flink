@@ -42,6 +42,7 @@ import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.windowing.time.Time
 
 import scala.collection.JavaConverters._
+import scala.collection.JavaConversions._
 import org.apache.flink.table.api._
 import org.apache.flink.table.calcite.FlinkTypeFactory
 import org.apache.flink.table.codegen.MatchCodeGenerator
@@ -49,6 +50,7 @@ import org.apache.flink.table.plan.logical.MatchRecognize
 import org.apache.flink.table.plan.nodes.CommonMatchRecognize
 import org.apache.flink.table.plan.rules.datastream.DataStreamRetractionRules
 import org.apache.flink.table.plan.schema.RowSchema
+import org.apache.flink.table.plan.util.PythonUtil.containsPythonCall
 import org.apache.flink.table.plan.util.RexDefaultVisitor
 import org.apache.flink.table.planner.StreamPlanner
 import org.apache.flink.table.runtime.`match`._
@@ -74,6 +76,11 @@ class DataStreamMatch(
   extends SingleRel(cluster, traitSet, inputNode)
   with CommonMatchRecognize
   with DataStreamRel {
+
+  if (logicalMatch.measures.values().exists(containsPythonCall(_)) ||
+    logicalMatch.patternDefinitions.values().exists(containsPythonCall(_))) {
+    throw new TableException("Python Function can not be used in MATCH_RECOGNIZE for now.")
+  }
 
   override def needsUpdatesAsRetraction = true
 
@@ -125,8 +132,7 @@ class DataStreamMatch(
   }
 
   override def translateToPlan(
-      planner: StreamPlanner,
-      queryConfig: StreamQueryConfig)
+      planner: StreamPlanner)
     : DataStream[CRow] = {
 
     val inputIsAccRetract = DataStreamRetractionRules.isAccRetract(getInput)
@@ -136,7 +142,7 @@ class DataStreamMatch(
 
     val crowInput: DataStream[CRow] = getInput
       .asInstanceOf[DataStreamRel]
-      .translateToPlan(planner, queryConfig)
+      .translateToPlan(planner)
 
     if (inputIsAccRetract) {
       throw new TableException(
@@ -144,7 +150,7 @@ class DataStreamMatch(
           "Note: Match recognize should not follow a non-windowed GroupBy aggregation.")
     }
 
-    val (timestampedInput, rowComparator) = translateOrder(planner,
+    val (timestampedInput, rowComparator, timeCharacteristic) = translateOrder(planner,
       crowInput,
       logicalMatch.orderKeys)
 
@@ -173,10 +179,18 @@ class DataStreamMatch(
     val partitionKeys = logicalMatch.partitionKeys
     val partitionedStream = applyPartitioning(partitionKeys, inputDS)
 
-    val patternStream: PatternStream[Row] = if (rowComparator.isDefined) {
+    val tmpPatternStream: PatternStream[Row] = if (rowComparator.isDefined) {
       CEP.pattern[Row](partitionedStream, cepPattern, new EventRowComparator(rowComparator.get))
     } else {
       CEP.pattern[Row](partitionedStream, cepPattern)
+    }
+
+    val patternStream = if (timeCharacteristic == TimeCharacteristic.ProcessingTime) {
+      tmpPatternStream.inProcessingTime();
+    } else if (timeCharacteristic == TimeCharacteristic.EventTime) {
+      tmpPatternStream.inEventTime()
+    } else {
+      throw new IllegalStateException(s"Unknown TimeCharacteristic ${timeCharacteristic}.")
     }
 
     val measures = logicalMatch.measures
@@ -197,7 +211,7 @@ class DataStreamMatch(
       planner: StreamPlanner,
       crowInput: DataStream[CRow],
       orderKeys: RelCollation)
-    : (DataStream[CRow], Option[RowComparator]) = {
+    : (DataStream[CRow], Option[RowComparator], TimeCharacteristic.Value) = {
 
     if (orderKeys.getFieldCollations.size() == 0) {
       throw new ValidationException("You must specify either rowtime or proctime for order by.")
@@ -231,9 +245,10 @@ class DataStreamMatch(
         (crowInput.process(
           new RowtimeProcessFunction(timeOrderField.getIndex, CRowTypeInfo(inputSchema.typeInfo))
         ).setParallelism(crowInput.getParallelism),
-          rowComparator)
+          rowComparator,
+          TimeCharacteristic.EventTime)
       case _ =>
-        (crowInput, rowComparator)
+        (crowInput, rowComparator, TimeCharacteristic.ProcessingTime)
     }
   }
 
@@ -247,6 +262,10 @@ class DataStreamMatch(
       inputDs
     }
   }
+}
+
+object TimeCharacteristic extends Enumeration {
+  val ProcessingTime, EventTime = Value
 }
 
 private class PatternVisitor(

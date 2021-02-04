@@ -18,29 +18,20 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.rpc.RpcService;
 
-import javax.annotation.Nonnull;
+import java.util.Collection;
 
-import java.util.UUID;
+/** {@link Dispatcher} factory interface. */
+public interface DispatcherFactory {
 
-/**
- * {@link Dispatcher} factory interface.
- */
-public interface DispatcherFactory<T extends Dispatcher> {
-
-	/**
-	 * Create a {@link Dispatcher} of the given type {@link T}.
-	 */
-	T createDispatcher(
-		@Nonnull RpcService rpcService,
-		@Nonnull PartialDispatcherServices partialDispatcherServices) throws Exception;
-
-	default String generateEndpointIdWithUUID() {
-		return getEndpointId() + UUID.randomUUID();
-	}
-
-	default String getEndpointId() {
-		return Dispatcher.DISPATCHER_NAME;
-	}
+    /** Create a {@link Dispatcher}. */
+    Dispatcher createDispatcher(
+            RpcService rpcService,
+            DispatcherId fencingToken,
+            Collection<JobGraph> recoveredJobs,
+            DispatcherBootstrapFactory dispatcherBootstrapFactory,
+            PartialDispatcherServicesWithJobGraphStore partialDispatcherServicesWithJobGraphStore)
+            throws Exception;
 }
