@@ -32,74 +32,77 @@ import javax.annotation.Nullable;
 
 import java.net.URI;
 import java.util.Collections;
-import java.util.Set;
 
-/**
- * Simple factory for the S3 file system.
- */
+/** Simple factory for the S3 file system. */
 public class S3FileSystemFactory extends AbstractS3FileSystemFactory {
 
-	private static final Logger LOG = LoggerFactory.getLogger(S3FileSystemFactory.class);
+    private static final Logger LOG = LoggerFactory.getLogger(S3FileSystemFactory.class);
 
-	// intentionally obfuscated to prevent relocations by the shade-plugin
-	private static final Set<String> PACKAGE_PREFIXES_TO_SHADE = Collections.singleton("com.UNSHADE.".replace("UNSHADE", "amazonaws"));
+    private static final String[] FLINK_CONFIG_PREFIXES = {"s3.", "s3a.", "fs.s3a."};
 
-	private static final Set<String> CONFIG_KEYS_TO_SHADE = Collections.singleton("fs.s3a.aws.credentials.provider");
+    private static final String[][] MIRRORED_CONFIG_KEYS = {
+        {"fs.s3a.access-key", "fs.s3a.access.key"},
+        {"fs.s3a.secret-key", "fs.s3a.secret.key"},
+        {"fs.s3a.path-style-access", "fs.s3a.path.style.access"},
+        // Flink v2 uses standard YAML which cannot represent a key that is both a scalar value and
+        // a parent of other keys (e.g. fs.s3a.endpoint and fs.s3a.endpoint.region conflict).
+        // These aliases allow users to set the scalar key via a ".value" suffix to avoid the
+        // collision, e.g. fs.s3a.endpoint.value maps to fs.s3a.endpoint in Hadoop config.
+        {"fs.s3a.endpoint.value", "fs.s3a.endpoint"},
+        {"fs.s3a.assumed.role.sts.endpoint.value", "fs.s3a.assumed.role.sts.endpoint"},
+        {"fs.s3a.fast.upload.value", "fs.s3a.fast.upload"},
+        {"fs.s3a.multipart.purge.value", "fs.s3a.multipart.purge"},
+        {"fs.s3a.s3guard.ddb.table.value", "fs.s3a.s3guard.ddb.table"},
+    };
 
-	// keep this in sync with the relocation pattern applied to com.amazon in the shade-plugin configuration
-	private static final String FLINK_SHADING_PREFIX = "org.apache.flink.fs.s3base.shaded.";
+    public S3FileSystemFactory() {
+        super("Hadoop s3a file system", createHadoopConfigLoader());
+    }
 
-	private static final String[] FLINK_CONFIG_PREFIXES = { "s3.", "s3a.", "fs.s3a." };
+    @Override
+    public String getScheme() {
+        return "s3";
+    }
 
-	private static final String[][] MIRRORED_CONFIG_KEYS = {
-			{ "fs.s3a.access-key", "fs.s3a.access.key" },
-			{ "fs.s3a.secret-key", "fs.s3a.secret.key" }
-	};
+    @VisibleForTesting
+    static HadoopConfigLoader createHadoopConfigLoader() {
+        return new HadoopConfigLoader(
+                FLINK_CONFIG_PREFIXES,
+                MIRRORED_CONFIG_KEYS,
+                "fs.s3a.",
+                Collections.emptySet(),
+                Collections.emptySet(),
+                "");
+    }
 
-	public S3FileSystemFactory() {
-		super("Hadoop s3a file system", createHadoopConfigLoader());
-	}
+    @Override
+    protected org.apache.hadoop.fs.FileSystem createHadoopFileSystem() {
+        return new S3AFileSystem();
+    }
 
-	@Override
-	public String getScheme() {
-		return "s3";
-	}
+    @Override
+    protected URI getInitURI(URI fsUri, org.apache.hadoop.conf.Configuration hadoopConfig) {
+        final String scheme = fsUri.getScheme();
+        final String authority = fsUri.getAuthority();
 
-	@VisibleForTesting
-	static HadoopConfigLoader createHadoopConfigLoader() {
-		return new HadoopConfigLoader(FLINK_CONFIG_PREFIXES, MIRRORED_CONFIG_KEYS,
-			"fs.s3a.", PACKAGE_PREFIXES_TO_SHADE, CONFIG_KEYS_TO_SHADE, FLINK_SHADING_PREFIX);
-	}
+        if (scheme == null && authority == null) {
+            fsUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
+        } else if (scheme != null && authority == null) {
+            URI defaultUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
+            if (scheme.equals(defaultUri.getScheme()) && defaultUri.getAuthority() != null) {
+                fsUri = defaultUri;
+            }
+        }
 
-	@Override
-	protected org.apache.hadoop.fs.FileSystem createHadoopFileSystem() {
-		return new S3AFileSystem();
-	}
+        LOG.debug("Using scheme {} for s3a file system backing the S3 File System", fsUri);
 
-	@Override
-	protected URI getInitURI(URI fsUri, org.apache.hadoop.conf.Configuration hadoopConfig) {
-		final String scheme = fsUri.getScheme();
-		final String authority = fsUri.getAuthority();
+        return fsUri;
+    }
 
-		if (scheme == null && authority == null) {
-			fsUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
-		}
-		else if (scheme != null && authority == null) {
-			URI defaultUri = org.apache.hadoop.fs.FileSystem.getDefaultUri(hadoopConfig);
-			if (scheme.equals(defaultUri.getScheme()) && defaultUri.getAuthority() != null) {
-				fsUri = defaultUri;
-			}
-		}
-
-		LOG.debug("Using scheme {} for s3a file system backing the S3 File System", fsUri);
-
-		return fsUri;
-	}
-
-	@Nullable
-	@Override
-	protected S3AccessHelper getS3AccessHelper(FileSystem fs) {
-		final S3AFileSystem s3Afs = (S3AFileSystem) fs;
-		return new HadoopS3AccessHelper(s3Afs, s3Afs.getConf());
-	}
+    @Nullable
+    @Override
+    protected S3AccessHelper getS3AccessHelper(FileSystem fs) {
+        final S3AFileSystem s3Afs = (S3AFileSystem) fs;
+        return new HadoopS3AccessHelper(s3Afs, s3Afs.getConf());
+    }
 }

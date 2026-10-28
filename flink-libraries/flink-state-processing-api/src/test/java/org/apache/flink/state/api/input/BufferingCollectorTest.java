@@ -18,28 +18,27 @@
 
 package org.apache.flink.state.api.input;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-/**
- * Test of the buffering collector.
- */
-public class BufferingCollectorTest {
+import static org.assertj.core.api.Assertions.assertThat;
 
-	@Test
-	public void testNestRemovesElement() {
-		BufferingCollector<Integer> collector = new BufferingCollector<>();
+/** Test of the buffering collector. */
+class BufferingCollectorTest {
 
-		collector.collect(1);
+    @Test
+    void testNestRemovesElement() {
+        BufferingCollector<Integer> collector = new BufferingCollector<>();
 
-		Assert.assertTrue("Failed to add element to collector", collector.hasNext());
-		Assert.assertEquals("Incorrect element removed from collector", Integer.valueOf(1), collector.next());
-		Assert.assertFalse("Failed to drop element from collector", collector.hasNext());
-	}
+        collector.collect(1);
 
-	@Test
-	public void testEmptyCollectorReturnsNull() {
-		BufferingCollector<Integer> collector = new BufferingCollector<>();
-		Assert.assertNull("Empty collector did not return null", collector.next());
-	}
+        assertThat(collector).as("Failed to add element to collector").hasNext();
+        assertThat(collector.next()).as("Incorrect element removed from collector").isOne();
+        assertThat(collector).as("Failed to drop element from collector").isExhausted();
+    }
+
+    @Test
+    void testEmptyCollectorReturnsNull() {
+        BufferingCollector<Integer> collector = new BufferingCollector<>();
+        assertThat(collector.next()).isNull();
+    }
 }

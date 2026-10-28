@@ -21,33 +21,34 @@ package org.apache.flink.cep.nfa.sharedbuffer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.runtime.state.heap.TestDuplicateSerializer;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-/**
- * Tests for {@link org.apache.flink.cep.nfa.sharedbuffer.Lockable.LockableTypeSerializer}.
- */
-public class LockableTypeSerializerTest {
+import static org.assertj.core.api.Assertions.assertThat;
 
-	/**
-	 * This tests that {@link Lockable.LockableTypeSerializer#duplicate()} works as expected.
-	 */
-	@Test
-	public void testDuplicate() {
-		IntSerializer nonDuplicatingInnerSerializer = IntSerializer.INSTANCE;
-		Assert.assertSame(nonDuplicatingInnerSerializer, nonDuplicatingInnerSerializer.duplicate());
-		Lockable.LockableTypeSerializer<Integer> candidateTestShallowDuplicate =
-			new Lockable.LockableTypeSerializer<>(nonDuplicatingInnerSerializer);
-		Assert.assertSame(candidateTestShallowDuplicate, candidateTestShallowDuplicate.duplicate());
+/** Tests for {@link org.apache.flink.cep.nfa.sharedbuffer.Lockable.LockableTypeSerializer}. */
+class LockableTypeSerializerTest {
 
-		TestDuplicateSerializer duplicatingInnerSerializer = new TestDuplicateSerializer();
-		Assert.assertNotSame(duplicatingInnerSerializer, duplicatingInnerSerializer.duplicate());
+    /** This tests that {@link Lockable.LockableTypeSerializer#duplicate()} works as expected. */
+    @Test
+    void testDuplicate() {
+        IntSerializer nonDuplicatingInnerSerializer = IntSerializer.INSTANCE;
+        assertThat(nonDuplicatingInnerSerializer.duplicate())
+                .isSameAs(nonDuplicatingInnerSerializer);
+        Lockable.LockableTypeSerializer<Integer> candidateTestShallowDuplicate =
+                new Lockable.LockableTypeSerializer<>(nonDuplicatingInnerSerializer);
+        assertThat(candidateTestShallowDuplicate.duplicate())
+                .isSameAs(candidateTestShallowDuplicate);
 
-		Lockable.LockableTypeSerializer<Integer> candidateTestDeepDuplicate =
-			new Lockable.LockableTypeSerializer<>(duplicatingInnerSerializer);
+        TestDuplicateSerializer duplicatingInnerSerializer = new TestDuplicateSerializer();
+        assertThat(duplicatingInnerSerializer.duplicate()).isNotSameAs(duplicatingInnerSerializer);
 
-		Lockable.LockableTypeSerializer<Integer> deepDuplicate = candidateTestDeepDuplicate.duplicate();
-		Assert.assertNotSame(candidateTestDeepDuplicate, deepDuplicate);
-		Assert.assertNotSame(candidateTestDeepDuplicate.getElementSerializer(), deepDuplicate.getElementSerializer());
-	}
+        Lockable.LockableTypeSerializer<Integer> candidateTestDeepDuplicate =
+                new Lockable.LockableTypeSerializer<>(duplicatingInnerSerializer);
+
+        Lockable.LockableTypeSerializer<Integer> deepDuplicate =
+                candidateTestDeepDuplicate.duplicate();
+        assertThat(deepDuplicate).isNotSameAs(candidateTestDeepDuplicate);
+        assertThat(deepDuplicate.getElementSerializer())
+                .isNotSameAs(candidateTestDeepDuplicate.getElementSerializer());
+    }
 }

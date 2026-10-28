@@ -24,6 +24,7 @@ import org.apache.flink.streaming.api.operators.TimestampedCollector;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElement;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
@@ -33,247 +34,276 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * Unordered implementation of the {@link StreamElementQueue}. The unordered stream element queue provides
- * asynchronous results as soon as they are completed. Additionally, it maintains the watermark-stream record order.
+ * Unordered implementation of the {@link StreamElementQueue}. The unordered stream element queue
+ * provides asynchronous results as soon as they are completed. Additionally, it maintains the
+ * watermark-stream record order.
  *
- * <p>Elements can be logically grouped into different segments separated by watermarks. A segment needs to be
- * completely emitted before entries from a following segment are emitted. Thus, no stream record can be overtaken
- * by a watermark and no watermark can overtake a stream record.
- * However, stream records falling in the same segment between two watermarks can overtake each other (their emission
- * order is not guaranteed).
+ * <p>Elements can be logically grouped into different segments separated by watermarks. A segment
+ * needs to be completely emitted before entries from a following segment are emitted. Thus, no
+ * stream record can be overtaken by a watermark and no watermark can overtake a stream record.
+ * However, stream records falling in the same segment between two watermarks can overtake each
+ * other (their emission order is not guaranteed).
  */
 @Internal
 public final class UnorderedStreamElementQueue<OUT> implements StreamElementQueue<OUT> {
 
-	private static final Logger LOG = LoggerFactory.getLogger(UnorderedStreamElementQueue.class);
+    private static final Logger LOG = LoggerFactory.getLogger(UnorderedStreamElementQueue.class);
 
-	/** Capacity of this queue. */
-	private final int capacity;
+    /** Capacity of this queue. */
+    private final int capacity;
 
-	/** Queue of queue entries segmented by watermarks. */
-	private final Deque<Segment<OUT>> segments;
+    /** Queue of queue entries segmented by watermarks. */
+    private final Deque<Segment<OUT>> segments;
 
-	private int numberOfEntries;
+    private int numberOfEntries;
 
-	public UnorderedStreamElementQueue(int capacity) {
-		Preconditions.checkArgument(capacity > 0, "The capacity must be larger than 0.");
+    private final AvailabilityHelper availabilityHelper = new AvailabilityHelper();
 
-		this.capacity = capacity;
-		// most likely scenario are 4 segments <elements, watermark, elements, watermark>
-		this.segments = new ArrayDeque<>(4);
-		this.numberOfEntries = 0;
-	}
+    public UnorderedStreamElementQueue(int capacity) {
+        Preconditions.checkArgument(capacity > 0, "The capacity must be larger than 0.");
 
-	@Override
-	public Optional<ResultFuture<OUT>> tryPut(StreamElement streamElement) {
-		if (size() < capacity) {
-			StreamElementQueueEntry<OUT> queueEntry;
-			if (streamElement.isRecord()) {
-				queueEntry = addRecord((StreamRecord<?>) streamElement);
-			} else if (streamElement.isWatermark()) {
-				queueEntry = addWatermark((Watermark) streamElement);
-			} else {
-				throw new UnsupportedOperationException("Cannot enqueue " + streamElement);
-			}
+        this.capacity = capacity;
+        // most likely scenario are 4 segments <elements, watermark, elements, watermark>
+        this.segments = new ArrayDeque<>(4);
+        this.numberOfEntries = 0;
+        this.availabilityHelper.resetAvailable();
+    }
 
-			numberOfEntries++;
+    @Override
+    public Optional<ResultFuture<OUT>> tryPut(StreamElement streamElement) {
+        if (!isFull()) {
+            StreamElementQueueEntry<OUT> queueEntry;
+            if (streamElement.isRecord()) {
+                queueEntry = addRecord((StreamRecord<?>) streamElement);
+            } else if (streamElement.isWatermark()) {
+                queueEntry = addWatermark((Watermark) streamElement);
+            } else {
+                throw new UnsupportedOperationException("Cannot enqueue " + streamElement);
+            }
 
-			LOG.debug("Put element into unordered stream element queue. New filling degree " +
-					"({}/{}).", size(), capacity);
+            numberOfEntries++;
 
-			return Optional.of(queueEntry);
-		} else {
-			LOG.debug("Failed to put element into unordered stream element queue because it " +
-					"was full ({}/{}).", size(), capacity);
+            LOG.debug(
+                    "Put element into unordered stream element queue. New filling degree "
+                            + "({}/{}).",
+                    size(),
+                    capacity);
 
-			return Optional.empty();
-		}
-	}
+            if (isFull()) {
+                availabilityHelper.resetUnavailable();
+            }
 
-	private StreamElementQueueEntry<OUT> addRecord(StreamRecord<?> record) {
-		// ensure that there is at least one segment
-		Segment<OUT> lastSegment;
-		if (segments.isEmpty()) {
-			lastSegment = addSegment(capacity);
-		} else {
-			lastSegment = segments.getLast();
-		}
+            return Optional.of(queueEntry);
+        } else {
+            LOG.debug(
+                    "Failed to put element into unordered stream element queue because it "
+                            + "was full ({}/{}).",
+                    size(),
+                    capacity);
 
-		// entry is bound to segment to notify it easily upon completion
-		StreamElementQueueEntry<OUT> queueEntry = new SegmentedStreamRecordQueueEntry<>(record, lastSegment);
-		lastSegment.add(queueEntry);
-		return queueEntry;
-	}
+            return Optional.empty();
+        }
+    }
 
-	private Segment<OUT> addSegment(int capacity) {
-		Segment newSegment = new Segment(capacity);
-		segments.addLast(newSegment);
-		return newSegment;
-	}
+    private StreamElementQueueEntry<OUT> addRecord(StreamRecord<?> record) {
+        // ensure that there is at least one segment
+        Segment<OUT> lastSegment;
+        if (segments.isEmpty()) {
+            lastSegment = addSegment(capacity);
+        } else {
+            lastSegment = segments.getLast();
+        }
 
-	private StreamElementQueueEntry<OUT> addWatermark(Watermark watermark) {
-		Segment<OUT> watermarkSegment;
-		if (!segments.isEmpty() && segments.getLast().isEmpty()) {
-			// reuse already existing segment if possible (completely drained) or the new segment added at the end of
-			// this method for two succeeding watermarks
-			watermarkSegment = segments.getLast();
-		} else {
-			watermarkSegment = addSegment(1);
-		}
+        // entry is bound to segment to notify it easily upon completion
+        StreamElementQueueEntry<OUT> queueEntry =
+                new SegmentedStreamRecordQueueEntry<>(record, lastSegment);
+        lastSegment.add(queueEntry);
+        return queueEntry;
+    }
 
-		StreamElementQueueEntry<OUT> watermarkEntry = new WatermarkQueueEntry<>(watermark);
-		watermarkSegment.add(watermarkEntry);
+    private Segment<OUT> addSegment(int capacity) {
+        Segment newSegment = new Segment(capacity);
+        segments.addLast(newSegment);
+        return newSegment;
+    }
 
-		// add a new segment for actual elements
-		addSegment(capacity);
-		return watermarkEntry;
-	}
+    private StreamElementQueueEntry<OUT> addWatermark(Watermark watermark) {
+        Segment<OUT> watermarkSegment;
+        if (!segments.isEmpty() && segments.getLast().isEmpty()) {
+            // reuse already existing segment if possible (completely drained) or the new segment
+            // added at the end of
+            // this method for two succeeding watermarks
+            watermarkSegment = segments.getLast();
+        } else {
+            watermarkSegment = addSegment(1);
+        }
 
-	@Override
-	public boolean hasCompletedElements() {
-		return !this.segments.isEmpty() && this.segments.getFirst().hasCompleted();
-	}
+        StreamElementQueueEntry<OUT> watermarkEntry = new WatermarkQueueEntry<>(watermark);
+        watermarkSegment.add(watermarkEntry);
 
-	@Override
-	public void emitCompletedElement(TimestampedCollector<OUT> output) {
-		if (segments.isEmpty()) {
-			return;
-		}
-		final Segment currentSegment = segments.getFirst();
-		numberOfEntries -= currentSegment.emitCompleted(output);
+        // add a new segment for actual elements
+        addSegment(capacity);
+        return watermarkEntry;
+    }
 
-		// remove any segment if there are further segments, if not leave it as an optimization even if empty
-		if (segments.size() > 1 && currentSegment.isEmpty()) {
-			segments.pop();
-		}
-	}
+    @Override
+    public boolean hasCompletedElements() {
+        return !this.segments.isEmpty() && this.segments.getFirst().hasCompleted();
+    }
 
-	@Override
-	public List<StreamElement> values() {
-		List<StreamElement> list = new ArrayList<>();
-		for (Segment s : segments) {
-			s.addPendingElements(list);
-		}
-		return list;
-	}
+    @Override
+    public void emitCompletedElement(TimestampedCollector<OUT> output) {
+        if (segments.isEmpty()) {
+            return;
+        }
+        boolean isFullBefore = isFull();
+        final Segment currentSegment = segments.getFirst();
+        numberOfEntries -= currentSegment.emitCompleted(output);
 
-	@Override
-	public boolean isEmpty() {
-		return numberOfEntries == 0;
-	}
+        // remove any segment if there are further segments, if not leave it as an optimization even
+        // if empty
+        if (segments.size() > 1 && currentSegment.isEmpty()) {
+            segments.pop();
+        }
+        if (isFullBefore && !isFull()) {
+            availabilityHelper.getUnavailableToResetAvailable().complete(null);
+        }
+    }
 
-	@Override
-	public int size() {
-		return numberOfEntries;
-	}
+    @Override
+    public List<StreamElement> values() {
+        List<StreamElement> list = new ArrayList<>();
+        for (Segment s : segments) {
+            s.addPendingElements(list);
+        }
+        return list;
+    }
 
-	/**
-	 * An entry that notifies the respective segment upon completion.
-	 */
-	static class SegmentedStreamRecordQueueEntry<OUT> extends StreamRecordQueueEntry<OUT> {
-		private final Segment<OUT> segment;
+    @Override
+    public boolean isEmpty() {
+        return numberOfEntries == 0;
+    }
 
-		SegmentedStreamRecordQueueEntry(StreamRecord<?> inputRecord, Segment<OUT> segment) {
-			super(inputRecord);
-			this.segment = segment;
-		}
+    @Override
+    public int size() {
+        return numberOfEntries;
+    }
 
-		@Override
-		public void complete(Collection<OUT> result) {
-			super.complete(result);
-			segment.completed(this);
-		}
-	}
+    @Override
+    public CompletableFuture<?> getAvailableFuture() {
+        return availabilityHelper.getAvailableFuture();
+    }
 
-	/**
-	 * A segment is a collection of queue entries that can be completed in arbitrary order.
-	 *
-	 * <p>All elements from one segment must be emitted before any element of the next segment is emitted.
-	 */
-	static class Segment<OUT> {
-		/** Unfinished input elements. */
-		private final Set<StreamElementQueueEntry<OUT>> incompleteElements;
+    private boolean isFull() {
+        return size() >= capacity;
+    }
 
-		/** Undrained finished elements. */
-		private final Queue<StreamElementQueueEntry<OUT>> completedElements;
+    /** An entry that notifies the respective segment upon completion. */
+    static class SegmentedStreamRecordQueueEntry<OUT> extends StreamRecordQueueEntry<OUT> {
+        private final Segment<OUT> segment;
 
-		Segment(int initialCapacity) {
-			incompleteElements = new HashSet<>(initialCapacity);
-			completedElements = new ArrayDeque<>(initialCapacity);
-		}
+        SegmentedStreamRecordQueueEntry(StreamRecord<?> inputRecord, Segment<OUT> segment) {
+            super(inputRecord);
+            this.segment = segment;
+        }
 
-		/**
-		 * Signals that an entry finished computation.
-		 */
-		void completed(StreamElementQueueEntry<OUT> elementQueueEntry) {
-			// adding only to completed queue if not completed before
-			// there may be a real result coming after a timeout result, which is updated in the queue entry but
-			// the entry is not re-added to the complete queue
-			if (incompleteElements.remove(elementQueueEntry)) {
-				completedElements.add(elementQueueEntry);
-			}
-		}
+        @Override
+        public void complete(Collection<OUT> result) {
+            super.complete(result);
+            segment.completed(this);
+        }
+    }
 
-		/**
-		 * True if there are no incomplete elements and all complete elements have been consumed.
-		 */
-		boolean isEmpty() {
-			return incompleteElements.isEmpty() && completedElements.isEmpty();
-		}
+    /**
+     * A segment is a collection of queue entries that can be completed in arbitrary order.
+     *
+     * <p>All elements from one segment must be emitted before any element of the next segment is
+     * emitted.
+     */
+    static class Segment<OUT> {
+        /** Unfinished input elements. */
+        private final Set<StreamElementQueueEntry<OUT>> incompleteElements;
 
-		/**
-		 * True if there is at least one completed elements, such that {@link #emitCompleted(TimestampedCollector)}
-		 * will actually output an element.
-		 */
-		boolean hasCompleted() {
-			return !completedElements.isEmpty();
-		}
+        /** Undrained finished elements. */
+        private final Queue<StreamElementQueueEntry<OUT>> completedElements;
 
-		/**
-		 * Adds the segmentd input elements for checkpointing including completed but not yet emitted elements.
-		 */
-		void addPendingElements(List<StreamElement> results) {
-			for (StreamElementQueueEntry<OUT> element : completedElements) {
-				results.add(element.getInputElement());
-			}
-			for (StreamElementQueueEntry<OUT> element : incompleteElements) {
-				results.add(element.getInputElement());
-			}
-		}
+        Segment(int initialCapacity) {
+            incompleteElements = CollectionUtil.newHashSetWithExpectedSize(initialCapacity);
+            completedElements = new ArrayDeque<>(initialCapacity);
+        }
 
-		/**
-		 * Pops one completed elements into the given output. Because an input element may produce an arbitrary
-		 * number of output elements, there is no correlation between the size of the collection and the popped
-		 * elements.
-		 *
-		 * @return the number of popped input elements.
-		 */
-		int emitCompleted(TimestampedCollector<OUT> output) {
-			final StreamElementQueueEntry<OUT> completedEntry = completedElements.poll();
-			if (completedEntry == null) {
-				return 0;
-			}
-			completedEntry.emitResult(output);
-			return 1;
-		}
+        /** Signals that an entry finished computation. */
+        void completed(StreamElementQueueEntry<OUT> elementQueueEntry) {
+            // adding only to completed queue if not completed before
+            // there may be a real result coming after a timeout result, which is updated in the
+            // queue entry but
+            // the entry is not re-added to the complete queue
+            if (incompleteElements.remove(elementQueueEntry)) {
+                completedElements.add(elementQueueEntry);
+            }
+        }
 
-		/**
-		 * Adds the given entry to this segment. If the element is completed (watermark), it is directly moved into the
-		 * completed queue.
-		 */
-		void add(StreamElementQueueEntry<OUT> queueEntry) {
-			if (queueEntry.isDone()) {
-				completedElements.add(queueEntry);
-			} else {
-				incompleteElements.add(queueEntry);
-			}
-		}
-	}
+        /**
+         * True if there are no incomplete elements and all complete elements have been consumed.
+         */
+        boolean isEmpty() {
+            return incompleteElements.isEmpty() && completedElements.isEmpty();
+        }
+
+        /**
+         * True if there is at least one completed elements, such that {@link
+         * #emitCompleted(TimestampedCollector)} will actually output an element.
+         */
+        boolean hasCompleted() {
+            return !completedElements.isEmpty();
+        }
+
+        /**
+         * Adds the segmentd input elements for checkpointing including completed but not yet
+         * emitted elements.
+         */
+        void addPendingElements(List<StreamElement> results) {
+            for (StreamElementQueueEntry<OUT> element : completedElements) {
+                results.add(element.getInputElement());
+            }
+            for (StreamElementQueueEntry<OUT> element : incompleteElements) {
+                results.add(element.getInputElement());
+            }
+        }
+
+        /**
+         * Pops one completed elements into the given output. Because an input element may produce
+         * an arbitrary number of output elements, there is no correlation between the size of the
+         * collection and the popped elements.
+         *
+         * @return the number of popped input elements.
+         */
+        int emitCompleted(TimestampedCollector<OUT> output) {
+            final StreamElementQueueEntry<OUT> completedEntry = completedElements.poll();
+            if (completedEntry == null) {
+                return 0;
+            }
+            completedEntry.emitResult(output);
+            return 1;
+        }
+
+        /**
+         * Adds the given entry to this segment. If the element is completed (watermark), it is
+         * directly moved into the completed queue.
+         */
+        void add(StreamElementQueueEntry<OUT> queueEntry) {
+            if (queueEntry.isDone()) {
+                completedElements.add(queueEntry);
+            } else {
+                incompleteElements.add(queueEntry);
+            }
+        }
+    }
 }

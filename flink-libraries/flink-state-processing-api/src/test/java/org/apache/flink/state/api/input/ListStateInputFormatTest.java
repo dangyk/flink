@@ -23,6 +23,7 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.checkpoint.OperatorState;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
@@ -35,74 +36,78 @@ import org.apache.flink.streaming.util.MockStreamingRuntimeContext;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.flink.util.Collector;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
 
-/**
- * Test for operator list state input format.
- */
-public class ListStateInputFormatTest {
-	private static ListStateDescriptor<Integer> descriptor = new ListStateDescriptor<>("state", Types.INT);
+import static org.assertj.core.api.Assertions.assertThat;
 
-	@Test
-	public void testReadListOperatorState() throws Exception {
-		try (OneInputStreamOperatorTestHarness<Integer, Void> testHarness = getTestHarness()) {
-			testHarness.open();
+/** Test for operator list state input format. */
+class ListStateInputFormatTest {
+    private static ListStateDescriptor<Integer> descriptor =
+            new ListStateDescriptor<>("state", Types.INT);
 
-			testHarness.processElement(1, 0);
-			testHarness.processElement(2, 0);
-			testHarness.processElement(3, 0);
+    @Test
+    void testReadListOperatorState() throws Exception {
+        try (OneInputStreamOperatorTestHarness<Integer, Void> testHarness = getTestHarness()) {
+            testHarness.open();
 
-			OperatorSubtaskState subtaskState = testHarness.snapshot(0, 0);
-			OperatorState state = new OperatorState(OperatorIDGenerator.fromUid("uid"), 1, 4);
-			state.putState(0, subtaskState);
+            testHarness.processElement(1, 0);
+            testHarness.processElement(2, 0);
+            testHarness.processElement(3, 0);
 
-			OperatorStateInputSplit split = new OperatorStateInputSplit(subtaskState.getManagedOperatorState(), 0);
+            OperatorSubtaskState subtaskState = testHarness.snapshot(0, 0);
+            OperatorState state =
+                    new OperatorState(null, null, OperatorIDGenerator.fromUid("uid"), 1, 4);
+            state.putState(0, subtaskState);
 
-			ListStateInputFormat<Integer> format = new ListStateInputFormat<>(state, descriptor);
+            OperatorStateInputSplit split =
+                    new OperatorStateInputSplit(subtaskState.getManagedOperatorState(), 0);
 
-			format.setRuntimeContext(new MockStreamingRuntimeContext(false, 1, 0));
-			format.open(split);
+            MockStreamingRuntimeContext runtimeContext = new MockStreamingRuntimeContext(1, 0);
+            ListStateInputFormat<Integer> format =
+                    new ListStateInputFormat<>(
+                            state,
+                            new Configuration(),
+                            null,
+                            descriptor,
+                            runtimeContext.getExecutionConfig());
 
-			List<Integer> results = new ArrayList<>();
+            format.setRuntimeContext(runtimeContext);
+            format.open(split);
 
-			while (!format.reachedEnd()) {
-				results.add(format.nextRecord(0));
-			}
+            List<Integer> results = new ArrayList<>();
 
-			results.sort(Comparator.naturalOrder());
+            while (!format.reachedEnd()) {
+                results.add(format.nextRecord(0));
+            }
 
-			Assert.assertEquals(
-				"Failed to read correct list state from state backend",
-				Arrays.asList(1, 2, 3),
-				results);
-		}
-	}
+            assertThat(results)
+                    .as("Failed to read correct list state from state backend")
+                    .containsExactlyInAnyOrder(1, 2, 3);
+        }
+    }
 
-	private OneInputStreamOperatorTestHarness<Integer, Void> getTestHarness() throws Exception {
-		return new OneInputStreamOperatorTestHarness<>(new StreamFlatMap<>(new StatefulFunction()), IntSerializer.INSTANCE);
-	}
+    private OneInputStreamOperatorTestHarness<Integer, Void> getTestHarness() throws Exception {
+        return new OneInputStreamOperatorTestHarness<>(
+                new StreamFlatMap<>(new StatefulFunction()), IntSerializer.INSTANCE);
+    }
 
-	static class StatefulFunction implements FlatMapFunction<Integer, Void>, CheckpointedFunction {
-		ListState<Integer> state;
+    static class StatefulFunction implements FlatMapFunction<Integer, Void>, CheckpointedFunction {
+        ListState<Integer> state;
 
-		@Override
-		public void flatMap(Integer value, Collector<Void> out) throws Exception {
-			state.add(value);
-		}
+        @Override
+        public void flatMap(Integer value, Collector<Void> out) throws Exception {
+            state.add(value);
+        }
 
-		@Override
-		public void snapshotState(FunctionSnapshotContext context) {
-		}
+        @Override
+        public void snapshotState(FunctionSnapshotContext context) {}
 
-		@Override
-		public void initializeState(FunctionInitializationContext context) throws Exception {
-			state = context.getOperatorStateStore().getListState(descriptor);
-		}
-	}
+        @Override
+        public void initializeState(FunctionInitializationContext context) throws Exception {
+            state = context.getOperatorStateStore().getListState(descriptor);
+        }
+    }
 }

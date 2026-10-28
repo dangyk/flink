@@ -18,46 +18,54 @@
 
 package org.apache.flink.client.python;
 
-import org.apache.flink.core.fs.Path;
+import org.apache.flink.configuration.Configuration;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.util.List;
+import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
 
-/**
- * Options for the {@link PythonDriver}.
- */
+/** Options for the {@link PythonDriver}. */
 final class PythonDriverOptions {
 
-	@Nonnull
-	private String entrypointModule;
+    private final Configuration pythonDependencyConfig;
 
-	@Nonnull
-	private List<Path> pythonLibFiles;
+    @Nullable private final String entryPointModule;
 
-	@Nonnull
-	private List<String> programArgs;
+    @Nullable private final String entryPointScript;
 
-	PythonDriverOptions(String entrypointModule, List<Path> pythonLibFiles, List<String> programArgs) {
-		this.entrypointModule = requireNonNull(entrypointModule, "entrypointModule");
-		this.pythonLibFiles = requireNonNull(pythonLibFiles, "pythonLibFiles");
-		this.programArgs = requireNonNull(programArgs, "programArgs");
-	}
+    @Nonnull private final List<String> programArgs;
 
-	@Nonnull
-	String getEntrypointModule() {
-		return entrypointModule;
-	}
+    @Nonnull
+    Configuration getPythonDependencyConfig() {
+        return pythonDependencyConfig;
+    }
 
-	@Nonnull
-	List<Path> getPythonLibFiles() {
-		return pythonLibFiles;
-	}
+    @Nullable
+    String getEntryPointModule() {
+        return entryPointModule;
+    }
 
-	@Nonnull
-	List<String> getProgramArgs() {
-		return programArgs;
-	}
+    Optional<String> getEntryPointScript() {
+        return Optional.ofNullable(entryPointScript);
+    }
+
+    @Nonnull
+    List<String> getProgramArgs() {
+        return programArgs;
+    }
+
+    PythonDriverOptions(
+            @Nonnull Configuration pythonDependencyConfig,
+            @Nullable String entryPointModule,
+            @Nullable String entryPointScript,
+            List<String> programArgs) {
+        this.pythonDependencyConfig = requireNonNull(pythonDependencyConfig);
+        this.entryPointModule = entryPointModule;
+        this.entryPointScript = entryPointScript;
+        this.programArgs = requireNonNull(programArgs, "programArgs");
+    }
 }

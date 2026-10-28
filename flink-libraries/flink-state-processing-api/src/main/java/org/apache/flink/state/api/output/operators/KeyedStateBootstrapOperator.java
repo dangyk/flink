@@ -19,6 +19,8 @@
 package org.apache.flink.state.api.output.operators;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
@@ -26,7 +28,6 @@ import org.apache.flink.state.api.functions.KeyedStateBootstrapFunction;
 import org.apache.flink.state.api.output.SnapshotUtils;
 import org.apache.flink.state.api.output.TaggedOperatorSubtaskState;
 import org.apache.flink.state.api.runtime.VoidTriggerable;
-import org.apache.flink.streaming.api.SimpleTimerService;
 import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -35,80 +36,97 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.util.Preconditions;
 
+import java.util.function.Supplier;
+
 /**
  * A {@link org.apache.flink.streaming.api.operators.StreamOperator} for executing {@link
  * KeyedStateBootstrapFunction}'s.
  */
 @Internal
 public class KeyedStateBootstrapOperator<K, IN>
-	extends AbstractUdfStreamOperator<TaggedOperatorSubtaskState, KeyedStateBootstrapFunction<K, IN>>
-	implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>,
-	BoundedOneInput {
+        extends AbstractUdfStreamOperator<
+                TaggedOperatorSubtaskState, KeyedStateBootstrapFunction<K, IN>>
+        implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>, BoundedOneInput {
 
-	private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 1L;
 
-	private final long timestamp;
+    private final long checkpointId;
 
-	private final Path savepointPath;
+    private final long timestamp;
 
-	private transient KeyedStateBootstrapOperator<K, IN>.ContextImpl context;
+    private final Path savepointPath;
 
-	public KeyedStateBootstrapOperator(long timestamp, Path savepointPath, KeyedStateBootstrapFunction<K, IN> function) {
-		super(function);
+    private transient KeyedStateBootstrapOperator<K, IN>.ContextImpl context;
 
-		this.timestamp = timestamp;
-		this.savepointPath = savepointPath;
-	}
+    public KeyedStateBootstrapOperator(
+            long checkpointId,
+            long timestamp,
+            Path savepointPath,
+            KeyedStateBootstrapFunction<K, IN> function) {
+        super(function);
 
-	@Override
-	public void open() throws Exception {
-		super.open();
+        this.checkpointId = checkpointId;
+        this.timestamp = timestamp;
+        this.savepointPath = savepointPath;
+    }
 
-		InternalTimerService<VoidNamespace> internalTimerService = getInternalTimerService(
-			"user-timers",
-			VoidNamespaceSerializer.INSTANCE,
-			VoidTriggerable.instance());
+    @Override
+    public void open() throws Exception {
+        super.open();
 
-		TimerService timerService = new SimpleTimerService(internalTimerService);
+        Supplier<InternalTimerService<VoidNamespace>> internalTimerService =
+                () ->
+                        getInternalTimerService(
+                                "user-timers",
+                                VoidNamespaceSerializer.INSTANCE,
+                                VoidTriggerable.instance());
 
-		context = new KeyedStateBootstrapOperator<K, IN>.ContextImpl(userFunction, timerService);
-	}
+        TimerService timerService =
+                new LazyTimerService(internalTimerService, getProcessingTimeService());
 
-	@Override
-	public void processElement(StreamRecord<IN> element) throws Exception {
-		userFunction.processElement(element.getValue(), context);
-	}
+        context = new KeyedStateBootstrapOperator<K, IN>.ContextImpl(userFunction, timerService);
+    }
 
-	@Override
-	public void endInput() throws Exception {
-		TaggedOperatorSubtaskState state = SnapshotUtils.snapshot(
-			this,
-			getRuntimeContext().getIndexOfThisSubtask(),
-			timestamp,
-			getContainingTask().getCheckpointStorage(),
-			savepointPath);
+    @Override
+    public void processElement(StreamRecord<IN> element) throws Exception {
+        userFunction.processElement(element.getValue(), context);
+    }
 
-		output.collect(new StreamRecord<>(state));
-	}
+    @Override
+    public void endInput() throws Exception {
+        Configuration jobConf = getContainingTask().getJobConfiguration();
+        TaggedOperatorSubtaskState state =
+                SnapshotUtils.snapshot(
+                        checkpointId,
+                        this,
+                        getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                        timestamp,
+                        CheckpointingOptions.getCheckpointingMode(jobConf),
+                        CheckpointingOptions.isUnalignedCheckpointEnabled(jobConf),
+                        getContainingTask().getConfiguration().getConfiguration(),
+                        savepointPath);
 
-	private class ContextImpl extends KeyedStateBootstrapFunction<K, IN>.Context {
+        output.collect(new StreamRecord<>(state));
+    }
 
-		private final TimerService timerService;
+    private class ContextImpl extends KeyedStateBootstrapFunction<K, IN>.Context {
 
-		ContextImpl(KeyedStateBootstrapFunction<K, IN> function, TimerService timerService) {
-			function.super();
-			this.timerService = Preconditions.checkNotNull(timerService);
-		}
+        private final TimerService timerService;
 
-		@Override
-		public TimerService timerService() {
-			return timerService;
-		}
+        ContextImpl(KeyedStateBootstrapFunction<K, IN> function, TimerService timerService) {
+            function.super();
+            this.timerService = Preconditions.checkNotNull(timerService);
+        }
 
-		@Override
-		@SuppressWarnings("unchecked")
-		public K getCurrentKey() {
-			return (K) KeyedStateBootstrapOperator.this.getCurrentKey();
-		}
-	}
+        @Override
+        public TimerService timerService() {
+            return timerService;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public K getCurrentKey() {
+            return (K) KeyedStateBootstrapOperator.this.getCurrentKey();
+        }
+    }
 }

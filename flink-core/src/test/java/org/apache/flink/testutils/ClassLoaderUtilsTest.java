@@ -18,56 +18,60 @@
 
 package org.apache.flink.testutils;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.function.Supplier;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
-/**
- * Tests for the {@link ClassLoaderUtils}.
- */
-public class ClassLoaderUtilsTest {
+/** Tests for the {@link ClassLoaderUtils}. */
+class ClassLoaderUtilsTest {
 
-	@Test
-	public void testObjectFromNewClassLoaderObject() throws Exception {
-		testObjectFromNewClassLoaderObject(ClassLoaderUtils::createSerializableObjectFromNewClassLoader);
-	}
+    @Test
+    void testObjectFromNewClassLoaderObject() {
+        testObjectFromNewClassLoaderObject(
+                ClassLoaderUtils::createSerializableObjectFromNewClassLoader);
+    }
 
-	@Test
-	public void testObjectFromNewClassLoaderClassLoaders() throws Exception {
-		testObjectFromNewClassLoaderClassLoaders(ClassLoaderUtils::createSerializableObjectFromNewClassLoader);
-	}
+    @Test
+    void testObjectFromNewClassLoaderClassLoaders() {
+        testObjectFromNewClassLoaderClassLoaders(
+                ClassLoaderUtils::createSerializableObjectFromNewClassLoader);
+    }
 
-	@Test
-	public void testExceptionObjectFromNewClassLoaderObject() throws Exception {
-		testObjectFromNewClassLoaderObject(ClassLoaderUtils::createExceptionObjectFromNewClassLoader);
-	}
+    @Test
+    void testExceptionObjectFromNewClassLoaderObject() {
+        testObjectFromNewClassLoaderObject(
+                ClassLoaderUtils::createExceptionObjectFromNewClassLoader);
+    }
 
-	@Test
-	public void testExceptionObjectFromNewClassLoaderClassLoaders() throws Exception {
-		testObjectFromNewClassLoaderClassLoaders(ClassLoaderUtils::createExceptionObjectFromNewClassLoader);
-	}
+    @Test
+    void testExceptionObjectFromNewClassLoaderClassLoaders() {
+        testObjectFromNewClassLoaderClassLoaders(
+                ClassLoaderUtils::createExceptionObjectFromNewClassLoader);
+    }
 
-	private static <X> void testObjectFromNewClassLoaderObject(Supplier<ClassLoaderUtils.ObjectAndClassLoader<X>> supplier) {
-		final ClassLoaderUtils.ObjectAndClassLoader<X> objectAndClassLoader = supplier.get();
-		final Object o = objectAndClassLoader.getObject();
+    private static <X> void testObjectFromNewClassLoaderObject(
+            Supplier<ClassLoaderUtils.ObjectAndClassLoader<X>> supplier) {
+        final ClassLoaderUtils.ObjectAndClassLoader<X> objectAndClassLoader = supplier.get();
+        final Object o = objectAndClassLoader.getObject();
 
-		assertNotEquals(ClassLoader.getSystemClassLoader(), o.getClass().getClassLoader());
+        assertThat(ClassLoader.getSystemClassLoader()).isNotEqualTo(o.getClass().getClassLoader());
 
-		try {
-			Class.forName(o.getClass().getName());
-			fail("should not be able to load class from the system class loader");
-		}
-		catch (ClassNotFoundException ignored) {}
-	}
+        try {
+            Class.forName(o.getClass().getName());
+            fail("should not be able to load class from the system class loader");
+        } catch (ClassNotFoundException ignored) {
+        }
+    }
 
-	private static <X> void testObjectFromNewClassLoaderClassLoaders(Supplier<ClassLoaderUtils.ObjectAndClassLoader<X>> supplier) {
-		final ClassLoaderUtils.ObjectAndClassLoader<X> objectAndClassLoader = supplier.get();
+    private static <X> void testObjectFromNewClassLoaderClassLoaders(
+            Supplier<ClassLoaderUtils.ObjectAndClassLoader<X>> supplier) {
+        final ClassLoaderUtils.ObjectAndClassLoader<X> objectAndClassLoader = supplier.get();
 
-		assertNotEquals(ClassLoader.getSystemClassLoader(), objectAndClassLoader.getClassLoader());
-		assertEquals(ClassLoader.getSystemClassLoader(), objectAndClassLoader.getClassLoader().getParent());
-	}
+        assertThat(ClassLoader.getSystemClassLoader())
+                .isNotEqualTo(objectAndClassLoader.getClassLoader())
+                .isEqualTo(objectAndClassLoader.getClassLoader().getParent());
+    }
 }

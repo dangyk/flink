@@ -25,10 +25,15 @@ import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.LocalReferenceExpression;
 import org.apache.flink.table.expressions.LookupCallExpression;
+import org.apache.flink.table.expressions.ModelReferenceExpression;
+import org.apache.flink.table.expressions.NestedFieldReferenceExpression;
+import org.apache.flink.table.expressions.ResolvedExpression;
+import org.apache.flink.table.expressions.SqlCallExpression;
 import org.apache.flink.table.expressions.TableReferenceExpression;
 import org.apache.flink.table.expressions.TypeLiteralExpression;
 import org.apache.flink.table.expressions.UnresolvedCallExpression;
 import org.apache.flink.table.expressions.UnresolvedReferenceExpression;
+import org.apache.flink.table.expressions.UnresolvedTypeLiteralExpression;
 import org.apache.flink.table.expressions.ValueLiteralExpression;
 
 /**
@@ -38,71 +43,96 @@ import org.apache.flink.table.expressions.ValueLiteralExpression;
 @Internal
 public abstract class ApiExpressionDefaultVisitor<T> extends ApiExpressionVisitor<T> {
 
-	protected abstract T defaultMethod(Expression expression);
+    protected abstract T defaultMethod(Expression expression);
 
-	// --------------------------------------------------------------------------------------------
-	// resolved expressions
-	// --------------------------------------------------------------------------------------------
+    // --------------------------------------------------------------------------------------------
+    // resolved expressions
+    // --------------------------------------------------------------------------------------------
 
-	@Override
-	public T visit(CallExpression call) {
-		return defaultMethod(call);
-	}
+    @Override
+    public T visit(CallExpression call) {
+        return defaultMethod(call);
+    }
 
-	@Override
-	public T visit(ValueLiteralExpression valueLiteral) {
-		return defaultMethod(valueLiteral);
-	}
+    @Override
+    public T visit(ValueLiteralExpression valueLiteral) {
+        return defaultMethod(valueLiteral);
+    }
 
-	@Override
-	public T visit(FieldReferenceExpression fieldReference) {
-		return defaultMethod(fieldReference);
-	}
+    @Override
+    public T visit(FieldReferenceExpression fieldReference) {
+        return defaultMethod(fieldReference);
+    }
 
-	@Override
-	public T visit(TypeLiteralExpression typeLiteral) {
-		return defaultMethod(typeLiteral);
-	}
+    @Override
+    public T visit(TypeLiteralExpression typeLiteral) {
+        return defaultMethod(typeLiteral);
+    }
 
-	// --------------------------------------------------------------------------------------------
-	// resolved API expressions
-	// --------------------------------------------------------------------------------------------
+    // --------------------------------------------------------------------------------------------
+    // resolved API expressions
+    // --------------------------------------------------------------------------------------------
 
-	@Override
-	public T visit(TableReferenceExpression tableReference) {
-		return defaultMethod(tableReference);
-	}
+    @Override
+    public T visit(TableReferenceExpression tableReference) {
+        return defaultMethod(tableReference);
+    }
 
-	@Override
-	public T visit(LocalReferenceExpression localReference) {
-		return defaultMethod(localReference);
-	}
+    @Override
+    public T visit(ModelReferenceExpression modelReference) {
+        return defaultMethod(modelReference);
+    }
 
-	// --------------------------------------------------------------------------------------------
-	// unresolved API expressions
-	// --------------------------------------------------------------------------------------------
+    @Override
+    public T visit(LocalReferenceExpression localReference) {
+        return defaultMethod(localReference);
+    }
 
-	@Override
-	public T visit(UnresolvedReferenceExpression unresolvedReference) {
-		return defaultMethod(unresolvedReference);
-	}
+    @Override
+    public T visit(ResolvedExpression other) {
+        return defaultMethod(other);
+    }
 
-	@Override
-	public T visit(LookupCallExpression lookupCall) {
-		return defaultMethod(lookupCall);
-	}
+    // --------------------------------------------------------------------------------------------
+    // unresolved API expressions
+    // --------------------------------------------------------------------------------------------
 
-	@Override
-	public T visit(UnresolvedCallExpression unresolvedCall) {
-		return defaultMethod(unresolvedCall);
-	}
+    @Override
+    public T visit(UnresolvedReferenceExpression unresolvedReference) {
+        return defaultMethod(unresolvedReference);
+    }
 
-	// --------------------------------------------------------------------------------------------
-	// other expressions
-	// --------------------------------------------------------------------------------------------
+    @Override
+    public T visit(UnresolvedTypeLiteralExpression unresolvedTypeExpression) {
+        return defaultMethod(unresolvedTypeExpression);
+    }
 
-	@Override
-	public T visitNonApiExpression(Expression other) {
-		return defaultMethod(other);
-	}
+    @Override
+    public T visit(LookupCallExpression lookupCall) {
+        return defaultMethod(lookupCall);
+    }
+
+    @Override
+    public T visit(UnresolvedCallExpression unresolvedCall) {
+        return defaultMethod(unresolvedCall);
+    }
+
+    @Override
+    public T visit(SqlCallExpression sqlCall) {
+        return defaultMethod(sqlCall);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // other expressions
+    // --------------------------------------------------------------------------------------------
+
+    @Override
+    public T visitNonApiExpression(Expression other) {
+        return defaultMethod(other);
+    }
+
+    @Override
+    public T visit(NestedFieldReferenceExpression nestedFieldReference) {
+        return defaultMethod(nestedFieldReference);
+    }
 }

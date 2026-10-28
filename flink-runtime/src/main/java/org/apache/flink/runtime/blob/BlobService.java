@@ -19,30 +19,39 @@
 package org.apache.flink.runtime.blob;
 
 import java.io.Closeable;
+import java.net.InetAddress;
 
-/**
- * A simple store and retrieve binary large objects (BLOBs).
- */
+/** A simple store and retrieve binary large objects (BLOBs). */
 public interface BlobService extends Closeable {
 
-	/**
-	 * Returns a BLOB service for accessing permanent BLOBs.
-	 *
-	 * @return BLOB service
-	 */
-	PermanentBlobService getPermanentBlobService();
+    /**
+     * Returns a BLOB service for accessing permanent BLOBs.
+     *
+     * @return BLOB service
+     */
+    PermanentBlobService getPermanentBlobService();
 
-	/**
-	 * Returns a BLOB service for accessing transient BLOBs.
-	 *
-	 * @return BLOB service
-	 */
-	TransientBlobService getTransientBlobService();
+    /**
+     * Returns a BLOB service for accessing transient BLOBs.
+     *
+     * @return BLOB service
+     */
+    TransientBlobService getTransientBlobService();
 
-	/**
-	 * Returns the port of the BLOB server that this BLOB service is working with.
-	 *
-	 * @return the port of the blob server.
-	 */
-	int getPort();
+    /**
+     * Returns the port of the BLOB server that this BLOB service is working with.
+     *
+     * @return the port of the blob server.
+     */
+    int getPort();
+
+    /**
+     * Returns the network address of the BLOB server that this BLOB service is working with. This
+     * default implementation returns the loopback address.
+     *
+     * @return the InetAddress of the BLOB server.
+     */
+    default InetAddress getAddress() {
+        return InetAddress.getLoopbackAddress();
+    }
 }

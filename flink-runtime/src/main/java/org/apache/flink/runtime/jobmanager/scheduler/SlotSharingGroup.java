@@ -18,57 +18,99 @@
 
 package org.apache.flink.runtime.jobmanager.scheduler;
 
-import java.util.Collections;
-import java.util.Set;
-import java.util.TreeSet;
-
+import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.instance.SlotSharingGroupId;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 
+import java.util.Collections;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
+
+import static org.apache.flink.util.Preconditions.checkNotNull;
+
 /**
- * A slot sharing units defines which different task (from different job vertices) can be
- * deployed together within a slot. This is a soft permission, in contrast to the hard constraint
- * defined by a co-location hint.
+ * A slot sharing units defines which different task (from different job vertices) can be deployed
+ * together within a slot. This is a soft permission, in contrast to the hard constraint defined by
+ * a co-location hint.
  */
 public class SlotSharingGroup implements java.io.Serializable {
-	
-	private static final long serialVersionUID = 1L;
 
-	private final Set<JobVertexID> ids = new TreeSet<JobVertexID>();
-	private final SlotSharingGroupId slotSharingGroupId = new SlotSharingGroupId();
-	
-	public SlotSharingGroup() {}
-	
-	public SlotSharingGroup(JobVertexID ... sharedVertices) {
-		for (JobVertexID id : sharedVertices) {
-			this.ids.add(id);
-		}
-	}
+    private static final long serialVersionUID = 1L;
 
-	// --------------------------------------------------------------------------------------------
-	
-	public void addVertexToGroup(JobVertexID id) {
-		this.ids.add(id);
-	}
-	
-	public void removeVertexFromGroup(JobVertexID id) {
-		this.ids.remove(id);
-	}
-	
-	public Set<JobVertexID> getJobVertexIds() {
-		return Collections.unmodifiableSet(ids);
-	}
+    private final Set<JobVertexID> ids = new TreeSet<>();
 
-	public SlotSharingGroupId getSlotSharingGroupId() {
-		return slotSharingGroupId;
-	}
-	
-	// ------------------------------------------------------------------------
-	//  Utilities
-	// ------------------------------------------------------------------------
-	
-	@Override
-	public String toString() {
-		return "SlotSharingGroup " + this.ids.toString();
-	}
+    private final SlotSharingGroupId slotSharingGroupId = new SlotSharingGroupId();
+
+    private String slotSharingGroupName;
+
+    // Represents resources of all tasks in the group. Default to be UNKNOWN.
+    private ResourceProfile resourceProfile = ResourceProfile.UNKNOWN;
+
+    // --------------------------------------------------------------------------------------------
+
+    public void addVertexToGroup(final JobVertexID id) {
+        ids.add(checkNotNull(id));
+    }
+
+    public void removeVertexFromGroup(final JobVertexID id) {
+        ids.remove(checkNotNull(id));
+    }
+
+    public Set<JobVertexID> getJobVertexIds() {
+        return Collections.unmodifiableSet(ids);
+    }
+
+    public SlotSharingGroupId getSlotSharingGroupId() {
+        return slotSharingGroupId;
+    }
+
+    public void setResourceProfile(ResourceProfile resourceProfile) {
+        this.resourceProfile = checkNotNull(resourceProfile);
+    }
+
+    public ResourceProfile getResourceProfile() {
+        return resourceProfile;
+    }
+
+    public String getSlotSharingGroupName() {
+        return slotSharingGroupName;
+    }
+
+    public void setSlotSharingGroupName(String slotSharingGroupName) {
+        this.slotSharingGroupName = slotSharingGroupName;
+    }
+
+    // ------------------------------------------------------------------------
+    //  Utilities
+    // ------------------------------------------------------------------------
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(slotSharingGroupId);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        SlotSharingGroup that = (SlotSharingGroup) o;
+        return Objects.equals(slotSharingGroupId, that.slotSharingGroupId);
+    }
+
+    @Override
+    public String toString() {
+        return "SlotSharingGroup{"
+                + "ids="
+                + ids
+                + ", slotSharingGroupId="
+                + slotSharingGroupId
+                + ", slotSharingGroupName='"
+                + slotSharingGroupName
+                + '\''
+                + ", resourceProfile="
+                + resourceProfile
+                + '}';
+    }
 }

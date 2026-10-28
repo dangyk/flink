@@ -24,155 +24,182 @@ import org.apache.flink.core.memory.DataOutputView;
 
 import java.io.IOException;
 
-import static org.apache.flink.api.common.typeutils.TypeSerializerConfigSnapshot.ADAPTER_VERSION;
-
 /**
- * A {@code TypeSerializerSnapshot} is a point-in-time view of a {@link TypeSerializer}'s configuration.
- * The configuration snapshot of a serializer is persisted within checkpoints
- * as a single source of meta information about the schema of serialized data in the checkpoint.
- * This serves three purposes:
+ * A {@code TypeSerializerSnapshot} is a point-in-time view of a {@link TypeSerializer}'s
+ * configuration. The configuration snapshot of a serializer is persisted within checkpoints as a
+ * single source of meta information about the schema of serialized data in the checkpoint. This
+ * serves three purposes:
  *
  * <ul>
- *   <li><strong>Capturing serializer parameters and schema:</strong> a serializer's configuration snapshot
- *   represents information about the parameters, state, and schema of a serializer.
- *   This is explained in more detail below.</li>
- *
- *   <li><strong>Compatibility checks for new serializers:</strong> when new serializers are available,
- *   they need to be checked whether or not they are compatible to read the data written by the previous serializer.
- *   This is performed by providing the new serializer to the correspondibng serializer configuration
- *   snapshots in checkpoints.</li>
- *
- *   <li><strong>Factory for a read serializer when schema conversion is required:</strong> in the case that new
- *   serializers are not compatible to read previous data, a schema conversion process executed across all data
- *   is required before the new serializer can be continued to be used. This conversion process requires a compatible
- *   read serializer to restore serialized bytes as objects, and then written back again using the new serializer.
- *   In this scenario, the serializer configuration snapshots in checkpoints doubles as a factory for the read
- *   serializer of the conversion process.</li>
+ *   <li><strong>Capturing serializer parameters and schema:</strong> a serializer's configuration
+ *       snapshot represents information about the parameters, state, and schema of a serializer.
+ *       This is explained in more detail below.
+ *   <li><strong>Compatibility checks for new serializers:</strong> when new serializers are
+ *       available, they need to be checked whether or not they are compatible to read the data
+ *       written by the previous serializer. This is performed by providing the new serializer
+ *       snapshots to resolve the compatibility with the corresponding previous serializer snapshots
+ *       in checkpoints.
+ *   <li><strong>Factory for a read serializer when schema conversion is required:</strong> in the
+ *       case that new serializers are not compatible to read previous data, a schema conversion
+ *       process executed across all data is required before the new serializer can be continued to
+ *       be used. This conversion process requires a compatible read serializer to restore
+ *       serialized bytes as objects, and then written back again using the new serializer. In this
+ *       scenario, the serializer configuration snapshots in checkpoints doubles as a factory for
+ *       the read serializer of the conversion process.
  * </ul>
  *
  * <h2>Serializer Configuration and Schema</h2>
  *
- * <p>Since serializer configuration snapshots needs to be used to ensure serialization compatibility
- * for the same managed state as well as serving as a factory for compatible read serializers, the configuration
- * snapshot should encode sufficient information about:
+ * <p>Since serializer configuration snapshots needs to be used to ensure serialization
+ * compatibility for the same managed state as well as serving as a factory for compatible read
+ * serializers, the configuration snapshot should encode sufficient information about:
  *
  * <ul>
- *   <li><strong>Parameter settings of the serializer:</strong> parameters of the serializer include settings
- *   required to setup the serializer, or the state of the serializer if it is stateful. If the serializer
- *   has nested serializers, then the configuration snapshot should also contain the parameters of the nested
- *   serializers.</li>
- *
- *   <li><strong>Serialization schema of the serializer:</strong> the binary format used by the serializer, or
- *   in other words, the schema of data written by the serializer.</li>
+ *   <li><strong>Parameter settings of the serializer:</strong> parameters of the serializer include
+ *       settings required to setup the serializer, or the state of the serializer if it is
+ *       stateful. If the serializer has nested serializers, then the configuration snapshot should
+ *       also contain the parameters of the nested serializers.
+ *   <li><strong>Serialization schema of the serializer:</strong> the binary format used by the
+ *       serializer, or in other words, the schema of data written by the serializer.
  * </ul>
  *
- * <p>NOTE: Implementations must contain the default empty nullary constructor. This is required to be able to
- * deserialize the configuration snapshot from its binary form.
+ * <p>NOTE: Implementations must contain the default empty nullary constructor. This is required to
+ * be able to deserialize the configuration snapshot from its binary form.
  *
  * @param <T> The data type that the originating serializer of this configuration serializes.
  */
 @PublicEvolving
 public interface TypeSerializerSnapshot<T> {
 
-	/**
-	 * Returns the version of the current snapshot's written binary format.
-	 *
-	 * @return the version of the current snapshot's written binary format.
-	 */
-	int getCurrentVersion();
+    /**
+     * Returns the version of the current snapshot's written binary format.
+     *
+     * @return the version of the current snapshot's written binary format.
+     */
+    int getCurrentVersion();
 
-	/**
-	 * Writes the serializer snapshot to the provided {@link DataOutputView}.
-	 * The current version of the written serializer snapshot's binary format
-	 * is specified by the {@link #getCurrentVersion()} method.
-	 *
-	 * @param out the {@link DataOutputView} to write the snapshot to.
-	 *
-	 * @throws IOException Thrown if the snapshot data could not be written.
-	 *
-	 * @see #writeVersionedSnapshot(DataOutputView, TypeSerializerSnapshot)
-	 */
-	void writeSnapshot(DataOutputView out) throws IOException;
+    /**
+     * Writes the serializer snapshot to the provided {@link DataOutputView}. The current version of
+     * the written serializer snapshot's binary format is specified by the {@link
+     * #getCurrentVersion()} method.
+     *
+     * @param out the {@link DataOutputView} to write the snapshot to.
+     * @throws IOException Thrown if the snapshot data could not be written.
+     * @see #writeVersionedSnapshot(DataOutputView, TypeSerializerSnapshot)
+     */
+    void writeSnapshot(DataOutputView out) throws IOException;
 
-	/**
-	 * Reads the serializer snapshot from the provided {@link DataInputView}.
-	 * The version of the binary format that the serializer snapshot was written
-	 * with is provided. This version can be used to determine how the serializer
-	 * snapshot should be read.
-	 *
-	 * @param readVersion version of the serializer snapshot's written binary format
-	 * @param in the {@link DataInputView} to read the snapshot from.
-	 * @param userCodeClassLoader the user code classloader
-	 *
-	 * @throws IOException Thrown if the snapshot data could be read or parsed.
-	 *
-	 * @see #readVersionedSnapshot(DataInputView, ClassLoader)
-	 */
-	void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader) throws IOException;
+    /**
+     * Reads the serializer snapshot from the provided {@link DataInputView}. The version of the
+     * binary format that the serializer snapshot was written with is provided. This version can be
+     * used to determine how the serializer snapshot should be read.
+     *
+     * @param readVersion version of the serializer snapshot's written binary format
+     * @param in the {@link DataInputView} to read the snapshot from.
+     * @param userCodeClassLoader the user code classloader
+     * @throws IOException Thrown if the snapshot data could be read or parsed.
+     * @see #readVersionedSnapshot(DataInputView, ClassLoader)
+     */
+    void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader)
+            throws IOException;
 
-	/**
-	 * Recreates a serializer instance from this snapshot. The returned
-	 * serializer can be safely used to read data written by the prior serializer
-	 * (i.e., the serializer that created this snapshot).
-	 *
-	 * @return a serializer instance restored from this serializer snapshot.
-	 */
-	TypeSerializer<T> restoreSerializer();
+    /**
+     * Recreates a serializer instance from this snapshot. The returned serializer can be safely
+     * used to read data written by the prior serializer (i.e., the serializer that created this
+     * snapshot).
+     *
+     * @return a serializer instance restored from this serializer snapshot.
+     */
+    TypeSerializer<T> restoreSerializer();
 
-	/**
-	 * Checks a new serializer's compatibility to read data written by the prior serializer.
-	 *
-	 * <p>When a checkpoint/savepoint is restored, this method checks whether the serialization
-	 * format of the data in the checkpoint/savepoint is compatible for the format of the serializer used by the
-	 * program that restores the checkpoint/savepoint. The outcome can be that the serialization format is
-	 * compatible, that the program's serializer needs to reconfigure itself (meaning to incorporate some
-	 * information from the TypeSerializerSnapshot to be compatible), that the format is outright incompatible,
-	 * or that a migration needed. In the latter case, the TypeSerializerSnapshot produces a serializer to
-	 * deserialize the data, and the restoring program's serializer re-serializes the data, thus converting
-	 * the format during the restore operation.
-	 *
-	 * @param newSerializer the new serializer to check.
-	 *
-	 * @return the serializer compatibility result.
-	 */
-	TypeSerializerSchemaCompatibility<T> resolveSchemaCompatibility(TypeSerializer<T> newSerializer);
+    /**
+     * Checks current serializer's compatibility to read data written by the prior serializer.
+     *
+     * <p>When a checkpoint/savepoint is restored, this method checks whether the serialization
+     * format of the data in the checkpoint/savepoint is compatible for the format of the serializer
+     * used by the program that restores the checkpoint/savepoint. The outcome can be that the
+     * serialization format is compatible, that the program's serializer needs to reconfigure itself
+     * (meaning to incorporate some information from the TypeSerializerSnapshot to be compatible),
+     * that the format is outright incompatible, or that a migration needed. In the latter case, the
+     * TypeSerializerSnapshot produces a serializer to deserialize the data, and the restoring
+     * program's serializer re-serializes the data, thus converting the format during the restore
+     * operation.
+     *
+     * <p>This method must be implemented to clarify the compatibility. See FLIP-263 for more
+     * details.
+     *
+     * @param oldSerializerSnapshot the old serializer snapshot to check.
+     * @return the serializer compatibility result.
+     */
+    TypeSerializerSchemaCompatibility<T> resolveSchemaCompatibility(
+            TypeSerializerSnapshot<T> oldSerializerSnapshot);
 
-	// ------------------------------------------------------------------------
-	//  read / write utilities
-	// ------------------------------------------------------------------------
+    /**
+     * Migrates a single state value from the schema described by {@code oldSerializerSnapshot} to
+     * the schema described by this (new) snapshot. Like {@link
+     * #resolveSchemaCompatibility(TypeSerializerSnapshot)}, this is invoked on the new snapshot and
+     * receives the old snapshot as its argument.
+     *
+     * <p>The default implementation returns the value unchanged: a value already deserialized with
+     * the prior serializer is structurally compatible with the current serializer, so the caller
+     * can re-serialize it as-is. A serializer whose in-memory representation is coupled to its
+     * schema should override this to transform the value into the new layout -- for example by
+     * inserting nulls for added fields or reordering fields by name. An implementation may return
+     * the given value or a new instance.
+     *
+     * <p>The migration is not applied recursively to nested serializers. The snapshot of a
+     * composite type returns its value unchanged unless it overrides this method to decompose the
+     * value and migrate each part, so a caller that needs a nested value migrated must reach the
+     * nested snapshot itself. An implementation that does so should not assume that the old and the
+     * new snapshot expose nested snapshots of the same type: restoring may have replaced those of
+     * the old snapshot with decorators, so nested snapshots are best matched by position or name
+     * rather than by class.
+     *
+     * @param oldSerializerSnapshot snapshot of the serializer that wrote the value. A caller that
+     *     holds the snapshot persisted with the state should pass that one in preference to a
+     *     snapshot re-derived from a serializer restored from it, because that round trip does not
+     *     always reproduce the schema that was written.
+     * @param value the value, already deserialized with the prior serializer. It may be {@code
+     *     null} wherever the prior serializer can produce {@code null}. An implementation that
+     *     decomposes a composite value may likewise pass {@code null} to a nested snapshot for an
+     *     absent part, even where that part's serializer would reject {@code null} at top level.
+     * @return the value adapted to the schema of the current serializer.
+     */
+    default T migrate(TypeSerializerSnapshot<T> oldSerializerSnapshot, T value) {
+        return value;
+    }
 
-	/**
-	 * Writes the given snapshot to the out stream. One should always use this method to write
-	 * snapshots out, rather than directly calling {@link #writeSnapshot(DataOutputView)}.
-	 *
-	 * <p>The snapshot written with this method can be read via {@link #readVersionedSnapshot(DataInputView, ClassLoader)}.
-	 */
-	static void writeVersionedSnapshot(DataOutputView out, TypeSerializerSnapshot<?> snapshot) throws IOException {
-		out.writeUTF(snapshot.getClass().getName());
-		out.writeInt(snapshot.getCurrentVersion());
-		snapshot.writeSnapshot(out);
-	}
+    // ------------------------------------------------------------------------
+    //  read / write utilities
+    // ------------------------------------------------------------------------
 
-	/**
-	 * Reads a snapshot from the stream, performing resolving
-	 *
-	 * <p>This method reads snapshots written by {@link #writeVersionedSnapshot(DataOutputView, TypeSerializerSnapshot)}.
-	 */
-	static <T> TypeSerializerSnapshot<T> readVersionedSnapshot(DataInputView in, ClassLoader cl) throws IOException {
-		final TypeSerializerSnapshot<T> snapshot =
-				TypeSerializerSnapshotSerializationUtil.readAndInstantiateSnapshotClass(in, cl);
+    /**
+     * Writes the given snapshot to the out stream. One should always use this method to write
+     * snapshots out, rather than directly calling {@link #writeSnapshot(DataOutputView)}.
+     *
+     * <p>The snapshot written with this method can be read via {@link
+     * #readVersionedSnapshot(DataInputView, ClassLoader)}.
+     */
+    static void writeVersionedSnapshot(DataOutputView out, TypeSerializerSnapshot<?> snapshot)
+            throws IOException {
+        out.writeUTF(snapshot.getClass().getName());
+        out.writeInt(snapshot.getCurrentVersion());
+        snapshot.writeSnapshot(out);
+    }
 
-		int version = in.readInt();
+    /**
+     * Reads a snapshot from the stream, performing resolving
+     *
+     * <p>This method reads snapshots written by {@link #writeVersionedSnapshot(DataOutputView,
+     * TypeSerializerSnapshot)}.
+     */
+    static <T> TypeSerializerSnapshot<T> readVersionedSnapshot(DataInputView in, ClassLoader cl)
+            throws IOException {
+        final TypeSerializerSnapshot<T> snapshot =
+                TypeSerializerSnapshotSerializationUtil.readAndInstantiateSnapshotClass(in, cl);
 
-		if (version == ADAPTER_VERSION && !(snapshot instanceof TypeSerializerConfigSnapshot)) {
-			// the snapshot was upgraded directly in-place from a TypeSerializerConfigSnapshot;
-			// read and drop the previously Java-serialized serializer, and get the actual correct read version.
-			// NOTE: this implicitly assumes that the version was properly written before the actual snapshot content.
-			TypeSerializerSerializationUtil.tryReadSerializer(in, cl, true);
-			version = in.readInt();
-		}
-		snapshot.readSnapshot(version, in, cl);
-
-		return snapshot;
-	}
+        int version = in.readInt();
+        snapshot.readSnapshot(version, in, cl);
+        return snapshot;
+    }
 }

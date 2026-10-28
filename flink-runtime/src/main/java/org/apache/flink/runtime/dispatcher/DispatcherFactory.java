@@ -18,29 +18,27 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.runtime.application.AbstractApplication;
+import org.apache.flink.runtime.highavailability.ApplicationResult;
+import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.streaming.api.graph.ExecutionPlan;
 
-import javax.annotation.Nonnull;
+import java.util.Collection;
 
-import java.util.UUID;
+/** {@link Dispatcher} factory interface. */
+public interface DispatcherFactory {
 
-/**
- * {@link Dispatcher} factory interface.
- */
-public interface DispatcherFactory<T extends Dispatcher> {
-
-	/**
-	 * Create a {@link Dispatcher} of the given type {@link T}.
-	 */
-	T createDispatcher(
-		@Nonnull RpcService rpcService,
-		@Nonnull PartialDispatcherServices partialDispatcherServices) throws Exception;
-
-	default String generateEndpointIdWithUUID() {
-		return getEndpointId() + UUID.randomUUID();
-	}
-
-	default String getEndpointId() {
-		return Dispatcher.DISPATCHER_NAME;
-	}
+    /** Create a {@link Dispatcher}. */
+    Dispatcher createDispatcher(
+            RpcService rpcService,
+            DispatcherId fencingToken,
+            Collection<ExecutionPlan> recoveredJobs,
+            Collection<JobResult> recoveredDirtyJobResults,
+            Collection<AbstractApplication> recoveredApplications,
+            Collection<ApplicationResult> recoveredDirtyApplicationResults,
+            DispatcherBootstrapFactory dispatcherBootstrapFactory,
+            PartialDispatcherServicesWithPersistenceComponents
+                    partialDispatcherServicesWithPersistenceComponents)
+            throws Exception;
 }

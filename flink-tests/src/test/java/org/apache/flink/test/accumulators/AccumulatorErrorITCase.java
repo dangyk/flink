@@ -22,187 +22,177 @@ import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.accumulators.DoubleCounter;
 import org.apache.flink.api.common.accumulators.LongCounter;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichMapFunction;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.api.java.io.DiscardingOutputFormat;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.configuration.TaskManagerOptions;
-import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
-import org.apache.flink.test.util.MiniClusterWithClientResource;
-import org.apache.flink.util.ExceptionUtils;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.test.junit5.MiniClusterExtension;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.junit.ClassRule;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Tests cases where accumulators:
- *  a) throw errors during runtime
- *  b) are not compatible with existing accumulator.
+ * Tests cases where accumulators: a) throw errors during runtime b) are not compatible with
+ * existing accumulator.
  */
-public class AccumulatorErrorITCase extends TestLogger {
-	private static final String FAULTY_CLONE_ACCUMULATOR = "faulty-clone";
-	private static final String FAULTY_MERGE_ACCUMULATOR = "faulty-merge";
-	private static final String INCOMPATIBLE_ACCUMULATORS_NAME = "incompatible-accumulators";
+@ExtendWith(TestLoggerExtension.class)
+class AccumulatorErrorITCase {
+    private static final String FAULTY_CLONE_ACCUMULATOR = "faulty-clone";
+    private static final String FAULTY_MERGE_ACCUMULATOR = "faulty-merge";
+    private static final String INCOMPATIBLE_ACCUMULATORS_NAME = "incompatible-accumulators";
 
-	@ClassRule
-	public static final MiniClusterWithClientResource MINI_CLUSTER_RESOURCE = new MiniClusterWithClientResource(
-		new MiniClusterResourceConfiguration.Builder()
-			.setNumberTaskManagers(2)
-			.setNumberSlotsPerTaskManager(3)
-			.build());
+    @RegisterExtension
+    private static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setNumberTaskManagers(2)
+                            .setNumberSlotsPerTaskManager(3)
+                            .build());
 
-	public static Configuration getConfiguration() {
-		Configuration config = new Configuration();
-		config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE, "12m");
-		return config;
-	}
+    @Test
+    void testFaultyAccumulator() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-	@Test
-	public void testFaultyAccumulator() throws Exception {
-		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+        // Test Exception forwarding with faulty Accumulator implementation
+        env.fromSequence(0, 10000)
+                .map(new FaultyAccumulatorUsingMapper())
+                .sinkTo(new DiscardingSink<>());
 
-		// Test Exception forwarding with faulty Accumulator implementation
-		env.generateSequence(0, 10000)
-			.map(new FaultyAccumulatorUsingMapper())
-			.output(new DiscardingOutputFormat<>());
+        assertAccumulatorsShouldFail(env.execute(), FaultyCloneAccumulator.class.getName());
+    }
 
-		assertAccumulatorsShouldFail(env.execute());
-	}
+    @Test
+    void testInvalidTypeAccumulator() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-	@Test
-	public void testInvalidTypeAccumulator() throws Exception {
-		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+        // Test Exception forwarding with faulty Accumulator implementation
+        env.fromSequence(0, 10000)
+                .map(new IncompatibleAccumulatorTypesMapper())
+                .map(new IncompatibleAccumulatorTypesMapper2())
+                .sinkTo(new DiscardingSink<>());
 
-		// Test Exception forwarding with faulty Accumulator implementation
-		env.generateSequence(0, 10000)
-			.map(new IncompatibleAccumulatorTypesMapper())
-			.map(new IncompatibleAccumulatorTypesMapper2())
-			.output(new DiscardingOutputFormat<>());
+        assertThatThrownBy(env::execute)
+                .cause()
+                .hasCauseInstanceOf(UnsupportedOperationException.class);
+    }
 
-		try {
-			env.execute();
-			fail("Should have failed.");
-		} catch (JobExecutionException e) {
-			assertTrue("Root cause should be:",
-					e.getCause() instanceof Exception);
-			assertTrue("Root cause should be:",
-					e.getCause().getCause() instanceof UnsupportedOperationException);
-		}
-	}
+    @Test
+    void testFaultyMergeAccumulator() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-	@Test
-	public void testFaultyMergeAccumulator() throws Exception {
-		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+        // Test Exception forwarding with faulty Accumulator implementation
+        env.fromSequence(0, 10000)
+                .map(new FaultyMergeAccumulatorUsingMapper())
+                .sinkTo(new DiscardingSink<>());
 
-		// Test Exception forwarding with faulty Accumulator implementation
-		env.generateSequence(0, 10000)
-			.map(new FaultyMergeAccumulatorUsingMapper())
-			.output(new DiscardingOutputFormat<>());
+        assertAccumulatorsShouldFail(env.execute(), FaultyMergeAccumulator.class.getName());
+    }
 
-		assertAccumulatorsShouldFail(env.execute());
-	}
+    /* testFaultyAccumulator */
 
-	/* testFaultyAccumulator */
+    private static class FaultyAccumulatorUsingMapper extends RichMapFunction<Long, Long> {
+        private static final long serialVersionUID = 42;
 
-	private static class FaultyAccumulatorUsingMapper extends RichMapFunction<Long, Long> {
-		private static final long serialVersionUID = 42;
+        @Override
+        public void open(OpenContext openContext) {
+            getRuntimeContext()
+                    .addAccumulator(FAULTY_CLONE_ACCUMULATOR, new FaultyCloneAccumulator());
+        }
 
-		@Override
-		public void open(Configuration parameters) throws Exception {
-			getRuntimeContext().addAccumulator(FAULTY_CLONE_ACCUMULATOR, new FaultyCloneAccumulator());
-		}
+        @Override
+        public Long map(Long value) {
+            return -1L;
+        }
+    }
 
-		@Override
-		public Long map(Long value) throws Exception {
-			return -1L;
-		}
-	}
+    private static class FaultyCloneAccumulator extends LongCounter {
+        private static final long serialVersionUID = 42;
 
-	private static class FaultyCloneAccumulator extends LongCounter {
-		private static final long serialVersionUID = 42;
+        @Override
+        public LongCounter clone() {
+            throw new CustomException(FaultyCloneAccumulator.class.getName());
+        }
+    }
 
-		@Override
-		public LongCounter clone() {
-			throw new CustomException();
-		}
-	}
+    /* testInvalidTypeAccumulator */
 
-	/* testInvalidTypeAccumulator */
+    private static class IncompatibleAccumulatorTypesMapper extends RichMapFunction<Long, Long> {
+        private static final long serialVersionUID = 42;
 
-	private static class IncompatibleAccumulatorTypesMapper extends RichMapFunction<Long, Long> {
-		private static final long serialVersionUID = 42;
+        @Override
+        public void open(OpenContext openContext) {
+            getRuntimeContext().addAccumulator(INCOMPATIBLE_ACCUMULATORS_NAME, new LongCounter());
+        }
 
-		@Override
-		public void open(Configuration parameters) throws Exception {
-			getRuntimeContext().addAccumulator(INCOMPATIBLE_ACCUMULATORS_NAME, new LongCounter());
-		}
+        @Override
+        public Long map(Long value) {
+            return -1L;
+        }
+    }
 
-		@Override
-		public Long map(Long value) throws Exception {
-			return -1L;
-		}
-	}
+    private static class IncompatibleAccumulatorTypesMapper2 extends RichMapFunction<Long, Long> {
+        private static final long serialVersionUID = 42;
 
-	private static class IncompatibleAccumulatorTypesMapper2 extends RichMapFunction<Long, Long> {
-		private static final long serialVersionUID = 42;
+        @Override
+        public void open(OpenContext openContext) {
+            getRuntimeContext().addAccumulator(INCOMPATIBLE_ACCUMULATORS_NAME, new DoubleCounter());
+        }
 
-		@Override
-		public void open(Configuration parameters) throws Exception {
-			getRuntimeContext().addAccumulator(INCOMPATIBLE_ACCUMULATORS_NAME, new DoubleCounter());
-		}
+        @Override
+        public Long map(Long value) {
+            return -1L;
+        }
+    }
 
-		@Override
-		public Long map(Long value) throws Exception {
-			return -1L;
-		}
-	}
+    /** */
+    private static class FaultyMergeAccumulatorUsingMapper extends RichMapFunction<Long, Long> {
+        private static final long serialVersionUID = 42;
 
-	/** */
+        @Override
+        public void open(OpenContext openContext) {
+            getRuntimeContext()
+                    .addAccumulator(FAULTY_MERGE_ACCUMULATOR, new FaultyMergeAccumulator());
+        }
 
-	private static class FaultyMergeAccumulatorUsingMapper extends RichMapFunction<Long, Long> {
-		private static final long serialVersionUID = 42;
+        @Override
+        public Long map(Long value) {
+            return -1L;
+        }
+    }
 
-		@Override
-		public void open(Configuration parameters) throws Exception {
-			getRuntimeContext().addAccumulator(FAULTY_MERGE_ACCUMULATOR, new FaultyMergeAccumulator());
-		}
+    private static class FaultyMergeAccumulator extends LongCounter {
+        private static final long serialVersionUID = 42;
 
-		@Override
-		public Long map(Long value) throws Exception {
-			return -1L;
-		}
-	}
+        @Override
+        public void merge(Accumulator<Long, Long> other) {
+            throw new CustomException(FaultyMergeAccumulator.class.getName());
+        }
 
-	private static class FaultyMergeAccumulator extends LongCounter {
-		private static final long serialVersionUID = 42;
+        @Override
+        public LongCounter clone() {
+            return new FaultyMergeAccumulator();
+        }
+    }
 
-		@Override
-		public void merge(Accumulator<Long, Long> other) {
-			throw new CustomException();
-		}
+    private static class CustomException extends RuntimeException {
+        private static final long serialVersionUID = 42;
 
-		@Override
-		public LongCounter clone() {
-			return new FaultyMergeAccumulator();
-		}
-	}
+        private CustomException(String message) {
+            super(message);
+        }
+    }
 
-	private static class CustomException extends RuntimeException {
-		private static final long serialVersionUID = 42;
-	}
-
-	private static void assertAccumulatorsShouldFail(JobExecutionResult result) {
-		try {
-			result.getAllAccumulatorResults();
-			fail("Should have failed");
-		}
-		catch (Exception ex) {
-			assertTrue(ExceptionUtils.findThrowable(ex, CustomException.class).isPresent());
-		}
-	}
+    private static void assertAccumulatorsShouldFail(
+            JobExecutionResult result, String expectedMessage) {
+        assertThatThrownBy(result::getAllAccumulatorResults)
+                .cause()
+                .hasCauseInstanceOf(CustomException.class)
+                .cause()
+                .hasMessage(expectedMessage);
+    }
 }

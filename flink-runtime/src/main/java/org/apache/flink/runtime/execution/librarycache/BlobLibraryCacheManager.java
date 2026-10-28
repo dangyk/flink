@@ -18,340 +18,529 @@
 
 package org.apache.flink.runtime.execution.librarycache;
 
+import org.apache.flink.api.common.ApplicationID;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.runtime.blob.PermanentBlobKey;
 import org.apache.flink.runtime.blob.PermanentBlobService;
-import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import org.apache.flink.runtime.rpc.FatalErrorHandler;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.FlinkUserCodeClassLoader;
+import org.apache.flink.util.FlinkUserCodeClassLoaders;
+import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.StringUtils;
+import org.apache.flink.util.UserCodeClassLoader;
+
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.type.TypeFactory;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
- * Provides facilities to download a set of libraries (typically JAR files) for a job from a
- * {@link PermanentBlobService} and create a class loader with references to them.
+ * Provides facilities to download a set of libraries (typically JAR files) for a job from a {@link
+ * PermanentBlobService} and create a class loader with references to them.
  */
+@ThreadSafe
 public class BlobLibraryCacheManager implements LibraryCacheManager {
 
-	private static final Logger LOG = LoggerFactory.getLogger(BlobLibraryCacheManager.class);
+    private static final Logger LOG = LoggerFactory.getLogger(BlobLibraryCacheManager.class);
 
-	private static final ExecutionAttemptID JOB_ATTEMPT_ID = new ExecutionAttemptID(-1, -1);
+    // --------------------------------------------------------------------------------------------
 
-	// --------------------------------------------------------------------------------------------
+    /** The global lock to synchronize operations. */
+    private final Object lockObject = new Object();
 
-	/** The global lock to synchronize operations */
-	private final Object lockObject = new Object();
+    /** Registered entries per job. */
+    @GuardedBy("lockObject")
+    private final Map<JobID, LibraryCacheEntry> cacheEntries = new HashMap<>();
 
-	/** Registered entries per job */
-	private final Map<JobID, LibraryCacheEntry> cacheEntries = new HashMap<>();
+    /** The blob service to download libraries. */
+    @GuardedBy("lockObject")
+    private final PermanentBlobService blobService;
 
-	/** The blob service to download libraries */
-	private final PermanentBlobService blobService;
+    private final ClassLoaderFactory classLoaderFactory;
 
-	/** The resolve order to use when creating a {@link ClassLoader}. */
-	private final FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder;
+    /** If true, it will use system class loader when the jars and classpaths of job are empty. */
+    private final boolean wrapsSystemClassLoader;
 
-	/**
-	 * List of patterns for classes that should always be resolved from the parent ClassLoader,
-	 * if possible.
-	 */
-	private final String[] alwaysParentFirstPatterns;
+    // --------------------------------------------------------------------------------------------
 
-	// --------------------------------------------------------------------------------------------
+    public BlobLibraryCacheManager(
+            PermanentBlobService blobService,
+            ClassLoaderFactory classLoaderFactory,
+            boolean wrapsSystemClassLoader) {
+        this.blobService = checkNotNull(blobService);
+        this.classLoaderFactory = checkNotNull(classLoaderFactory);
+        this.wrapsSystemClassLoader = wrapsSystemClassLoader;
+    }
 
-	public BlobLibraryCacheManager(
-			PermanentBlobService blobService,
-			FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder,
-			String[] alwaysParentFirstPatterns) {
-		this.blobService = checkNotNull(blobService);
-		this.classLoaderResolveOrder = checkNotNull(classLoaderResolveOrder);
-		this.alwaysParentFirstPatterns = alwaysParentFirstPatterns;
-	}
+    @Override
+    public ClassLoaderLease registerClassLoaderLease(JobID jobId, ApplicationID applicationId) {
+        synchronized (lockObject) {
+            return cacheEntries
+                    .computeIfAbsent(jobId, jobID -> new LibraryCacheEntry(jobId, applicationId))
+                    .obtainLease();
+        }
+    }
 
-	@Override
-	public void registerJob(JobID id, Collection<PermanentBlobKey> requiredJarFiles, Collection<URL> requiredClasspaths)
-		throws IOException {
-		registerTask(id, JOB_ATTEMPT_ID, requiredJarFiles, requiredClasspaths);
-	}
+    /**
+     * Gets the number of tasks holding {@link ClassLoader} references for the given job.
+     *
+     * @param jobId ID of a job
+     * @return number of reference holders
+     */
+    int getNumberOfReferenceHolders(JobID jobId) {
+        synchronized (lockObject) {
+            LibraryCacheEntry entry = cacheEntries.get(jobId);
+            return entry == null ? 0 : entry.getReferenceCount();
+        }
+    }
 
-	@Override
-	public void registerTask(
-		JobID jobId,
-		ExecutionAttemptID task,
-		@Nullable Collection<PermanentBlobKey> requiredJarFiles,
-		@Nullable Collection<URL> requiredClasspaths) throws IOException {
+    /**
+     * Returns the number of registered jobs that this library cache manager handles.
+     *
+     * @return number of jobs (irrespective of the actual number of tasks per job)
+     */
+    int getNumberOfManagedJobs() {
+        synchronized (lockObject) {
+            return cacheEntries.size();
+        }
+    }
 
-		checkNotNull(jobId, "The JobId must not be null.");
-		checkNotNull(task, "The task execution id must not be null.");
+    @Override
+    public void shutdown() {
+        synchronized (lockObject) {
+            for (LibraryCacheEntry entry : cacheEntries.values()) {
+                entry.releaseClassLoader();
+            }
 
-		if (requiredJarFiles == null) {
-			requiredJarFiles = Collections.emptySet();
-		}
-		if (requiredClasspaths == null) {
-			requiredClasspaths = Collections.emptySet();
-		}
+            cacheEntries.clear();
+        }
+    }
 
-		synchronized (lockObject) {
-			LibraryCacheEntry entry = cacheEntries.get(jobId);
+    // --------------------------------------------------------------------------------------------
 
-			if (entry == null) {
-				URL[] urls = new URL[requiredJarFiles.size() + requiredClasspaths.size()];
-				int count = 0;
-				try {
-					// add URLs to locally cached JAR files
-					for (PermanentBlobKey key : requiredJarFiles) {
-						urls[count] = blobService.getFile(jobId, key).toURI().toURL();
-						++count;
-					}
+    @FunctionalInterface
+    public interface ClassLoaderFactory {
+        URLClassLoader createClassLoader(URL[] libraryURLs);
+    }
 
-					// add classpaths
-					for (URL url : requiredClasspaths) {
-						urls[count] = url;
-						++count;
-					}
+    private static final class DefaultClassLoaderFactory implements ClassLoaderFactory {
 
-					cacheEntries.put(jobId, new LibraryCacheEntry(
-						requiredJarFiles, requiredClasspaths, urls, task, classLoaderResolveOrder, alwaysParentFirstPatterns));
-				} catch (Throwable t) {
-					// rethrow or wrap
-					ExceptionUtils.tryRethrowIOException(t);
-					throw new IOException(
-						"Library cache could not register the user code libraries.", t);
-				}
-			} else {
-				entry.register(task, requiredJarFiles, requiredClasspaths);
-			}
-		}
-	}
+        /** The resolve order to use when creating a {@link ClassLoader}. */
+        private final FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder;
 
-	@Override
-	public void unregisterJob(JobID id) {
-		unregisterTask(id, JOB_ATTEMPT_ID);
-	}
+        /**
+         * List of patterns for classes that should always be resolved from the parent ClassLoader,
+         * if possible.
+         */
+        private final String[] alwaysParentFirstPatterns;
 
-	@Override
-	public void unregisterTask(JobID jobId, ExecutionAttemptID task) {
-		checkNotNull(jobId, "The JobId must not be null.");
-		checkNotNull(task, "The task execution id must not be null.");
+        /** Class loading exception handler. */
+        private final Consumer<Throwable> classLoadingExceptionHandler;
 
-		synchronized (lockObject) {
-			LibraryCacheEntry entry = cacheEntries.get(jobId);
+        /** Test if classloader is used outside of job. */
+        private final boolean checkClassLoaderLeak;
 
-			if (entry != null) {
-				if (entry.unregister(task)) {
-					cacheEntries.remove(jobId);
+        private DefaultClassLoaderFactory(
+                FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder,
+                String[] alwaysParentFirstPatterns,
+                Consumer<Throwable> classLoadingExceptionHandler,
+                boolean checkClassLoaderLeak) {
+            this.classLoaderResolveOrder = classLoaderResolveOrder;
+            this.alwaysParentFirstPatterns = alwaysParentFirstPatterns;
+            this.classLoadingExceptionHandler = classLoadingExceptionHandler;
+            this.checkClassLoaderLeak = checkClassLoaderLeak;
+        }
 
-					entry.releaseClassLoader();
-				}
-			}
-			// else has already been unregistered
-		}
-	}
+        @Override
+        public URLClassLoader createClassLoader(URL[] libraryURLs) {
+            return FlinkUserCodeClassLoaders.create(
+                    classLoaderResolveOrder,
+                    libraryURLs,
+                    FlinkUserCodeClassLoaders.class.getClassLoader(),
+                    alwaysParentFirstPatterns,
+                    classLoadingExceptionHandler,
+                    checkClassLoaderLeak);
+        }
+    }
 
-	@Override
-	public ClassLoader getClassLoader(JobID jobId) {
-		checkNotNull(jobId, "The JobId must not be null.");
+    public static ClassLoaderFactory defaultClassLoaderFactory(
+            FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder,
+            String[] alwaysParentFirstPatterns,
+            @Nullable FatalErrorHandler fatalErrorHandlerJvmMetaspaceOomError,
+            boolean checkClassLoaderLeak) {
+        return new DefaultClassLoaderFactory(
+                classLoaderResolveOrder,
+                alwaysParentFirstPatterns,
+                createClassLoadingExceptionHandler(fatalErrorHandlerJvmMetaspaceOomError),
+                checkClassLoaderLeak);
+    }
 
-		synchronized (lockObject) {
-			LibraryCacheEntry entry = cacheEntries.get(jobId);
-			if (entry == null) {
-				throw new IllegalStateException("No libraries are registered for job " + jobId);
-			}
-			return entry.getClassLoader();
-		}
-	}
+    private static Consumer<Throwable> createClassLoadingExceptionHandler(
+            @Nullable FatalErrorHandler fatalErrorHandlerJvmMetaspaceOomError) {
+        return fatalErrorHandlerJvmMetaspaceOomError != null
+                ? classLoadingException -> {
+                    if (ExceptionUtils.isMetaspaceOutOfMemoryError(classLoadingException)) {
+                        fatalErrorHandlerJvmMetaspaceOomError.onFatalError(classLoadingException);
+                    }
+                }
+                : FlinkUserCodeClassLoader.NOOP_EXCEPTION_HANDLER;
+    }
 
-	/**
-	 * Gets the number of tasks holding {@link ClassLoader} references for the given job.
-	 *
-	 * @param jobId ID of a job
-	 *
-	 * @return number of reference holders
-	 */
-	int getNumberOfReferenceHolders(JobID jobId) {
-		synchronized (lockObject) {
-			LibraryCacheEntry entry = cacheEntries.get(jobId);
-			return entry == null ? 0 : entry.getNumberOfReferenceHolders();
-		}
-	}
+    // --------------------------------------------------------------------------------------------
 
-	/**
-	 * Returns the number of registered jobs that this library cache manager handles.
-	 *
-	 * @return number of jobs (irrespective of the actual number of tasks per job)
-	 */
-	int getNumberOfManagedJobs() {
-		// no synchronisation necessary
-		return cacheEntries.size();
-	}
+    private final class LibraryCacheEntry {
+        private final JobID jobId;
 
-	@Override
-	public void shutdown() {
-		synchronized (lockObject) {
-			for (LibraryCacheEntry entry : cacheEntries.values()) {
-				entry.releaseClassLoader();
-			}
-		}
-	}
+        private final ApplicationID applicationId;
 
-	@Override
-	public boolean hasClassLoader(@Nonnull JobID jobId) {
-		synchronized (lockObject) {
-			return cacheEntries.containsKey(jobId);
-		}
-	}
+        @GuardedBy("lockObject")
+        private int referenceCount;
 
-	// --------------------------------------------------------------------------------------------
+        @GuardedBy("lockObject")
+        @Nullable
+        private ResolvedClassLoader resolvedClassLoader;
 
-	/**
-	 * An entry in the per-job library cache. Tracks which execution attempts
-	 * still reference the libraries. Once none reference it any more, the
-	 * class loaders can be cleaned up.
-	 */
-	private static class LibraryCacheEntry {
+        @GuardedBy("lockObject")
+        private boolean isReleased;
 
-		private final URLClassLoader classLoader;
+        private LibraryCacheEntry(JobID jobId, ApplicationID applicationId) {
+            this.jobId = jobId;
+            this.applicationId = applicationId;
+            referenceCount = 0;
+            this.resolvedClassLoader = null;
+            this.isReleased = false;
+        }
 
-		private final Set<ExecutionAttemptID> referenceHolders;
-		/**
-		 * Set of BLOB keys used for a previous job/task registration.
-		 *
-		 * <p>The purpose of this is to make sure, future registrations do not differ in content as
-		 * this is a contract of the {@link BlobLibraryCacheManager}.
-		 */
-		private final Set<PermanentBlobKey> libraries;
+        private UserCodeClassLoader getOrResolveClassLoader(
+                Collection<PermanentBlobKey> libraries, Collection<URL> classPaths)
+                throws IOException {
+            synchronized (lockObject) {
+                verifyIsNotReleased();
 
-		/**
-		 * Set of class path URLs used for a previous job/task registration.
-		 *
-		 * <p>The purpose of this is to make sure, future registrations do not differ in content as
-		 * this is a contract of the {@link BlobLibraryCacheManager}.
-		 */
-		private final Set<String> classPaths;
+                if (resolvedClassLoader == null) {
+                    boolean systemClassLoader =
+                            wrapsSystemClassLoader && libraries.isEmpty() && classPaths.isEmpty();
+                    resolvedClassLoader =
+                            new ResolvedClassLoader(
+                                    systemClassLoader
+                                            ? ClassLoader.getSystemClassLoader()
+                                            : createUserCodeClassLoader(
+                                                    jobId, applicationId, libraries, classPaths),
+                                    libraries,
+                                    classPaths,
+                                    systemClassLoader);
+                } else {
+                    resolvedClassLoader.verifyClassLoader(libraries, classPaths);
+                }
 
-		/**
-		 * Creates a cache entry for a flink class loader with the given <tt>libraryURLs</tt>.
-		 *
-		 * @param requiredLibraries
-		 * 		BLOB keys required by the class loader (stored for ensuring consistency among different
-		 * 		job/task registrations)
-		 * @param requiredClasspaths
-		 * 		class paths required by the class loader (stored for ensuring consistency among
-		 * 		different job/task registrations)
-		 * @param libraryURLs
-		 * 		complete list of URLs to use for the class loader (includes references to the
-		 * 		<tt>requiredLibraries</tt> and <tt>requiredClasspaths</tt>)
-		 * @param initialReference
-		 * 		reference holder ID
-		 * @param classLoaderResolveOrder Whether to resolve classes first in the child ClassLoader
-		 * 		or parent ClassLoader
-		 * @param alwaysParentFirstPatterns A list of patterns for classes that should always be
-		 * 		resolved from the parent ClassLoader (if possible).
-		 */
-		LibraryCacheEntry(
-				Collection<PermanentBlobKey> requiredLibraries,
-				Collection<URL> requiredClasspaths,
-				URL[] libraryURLs,
-				ExecutionAttemptID initialReference,
-				FlinkUserCodeClassLoaders.ResolveOrder classLoaderResolveOrder,
-				String[] alwaysParentFirstPatterns) {
+                return resolvedClassLoader;
+            }
+        }
 
-			this.classLoader =
-				FlinkUserCodeClassLoaders.create(
-					classLoaderResolveOrder,
-					libraryURLs,
-					FlinkUserCodeClassLoaders.class.getClassLoader(),
-					alwaysParentFirstPatterns);
+        @GuardedBy("lockObject")
+        private URLClassLoader createUserCodeClassLoader(
+                JobID jobId,
+                ApplicationID applicationId,
+                Collection<PermanentBlobKey> requiredJarFiles,
+                Collection<URL> requiredClasspaths)
+                throws IOException {
+            try {
+                final URL[] libraryURLs =
+                        new URL[requiredJarFiles.size() + requiredClasspaths.size()];
+                int count = 0;
+                // add URLs to locally cached JAR files
+                for (PermanentBlobKey key : requiredJarFiles) {
+                    try {
+                        // first try job specific libraries
+                        libraryURLs[count] = blobService.getFile(jobId, key).toURI().toURL();
+                    } catch (Exception e) {
+                        // then try application specific libraries
+                        LOG.info(
+                                "Falling back to application blob {} with application id {} for job {}.",
+                                key,
+                                applicationId,
+                                jobId);
+                        libraryURLs[count] =
+                                blobService.getFile(applicationId, key).toURI().toURL();
+                    }
+                    ++count;
+                }
 
-			// NOTE: do not store the class paths, i.e. URLs, into a set for performance reasons
-			//       see http://findbugs.sourceforge.net/bugDescriptions.html#DMI_COLLECTION_OF_URLS
-			//       -> alternatively, compare their string representation
-			this.classPaths = new HashSet<>(requiredClasspaths.size());
-			for (URL url : requiredClasspaths) {
-				classPaths.add(url.toString());
-			}
-			this.libraries = new HashSet<>(requiredLibraries);
-			this.referenceHolders = new HashSet<>();
-			this.referenceHolders.add(initialReference);
-		}
+                // add classpaths
+                for (URL url : requiredClasspaths) {
+                    libraryURLs[count] = url;
+                    ++count;
+                }
 
-		public ClassLoader getClassLoader() {
-			return classLoader;
-		}
+                return classLoaderFactory.createClassLoader(libraryURLs);
+            } catch (Exception e) {
+                // rethrow or wrap
+                ExceptionUtils.tryRethrowIOException(e);
+                throw new IOException(
+                        "Library cache could not register the user code libraries.", e);
+            }
+        }
 
-		public Set<PermanentBlobKey> getLibraries() {
-			return libraries;
-		}
+        @GuardedBy("lockObject")
+        public int getReferenceCount() {
+            return referenceCount;
+        }
 
-		public void register(
-				ExecutionAttemptID task, Collection<PermanentBlobKey> requiredLibraries,
-				Collection<URL> requiredClasspaths) {
+        @GuardedBy("lockObject")
+        private DefaultClassLoaderLease obtainLease() {
+            verifyIsNotReleased();
+            referenceCount += 1;
+            return DefaultClassLoaderLease.create(this);
+        }
 
-			// Make sure the previous registration referred to the same libraries and class paths.
-			// NOTE: the original collections may contain duplicates and may not already be Set
-			//       collections with fast checks whether an item is contained in it.
+        private void release() {
+            synchronized (lockObject) {
+                if (isReleased) {
+                    return;
+                }
 
-			// lazy construction of a new set for faster comparisons
-			if (libraries.size() != requiredLibraries.size() ||
-				!new HashSet<>(requiredLibraries).containsAll(libraries)) {
+                if (referenceCount > 0) {
+                    referenceCount -= 1;
+                }
 
-				throw new IllegalStateException(
-					"The library registration references a different set of library BLOBs than" +
-						" previous registrations for this job:\nold:" + libraries.toString() +
-						"\nnew:" + requiredLibraries.toString());
-			}
+                if (referenceCount == 0) {
+                    releaseClassLoader();
+                    cacheEntries.remove(jobId);
+                }
+            }
+        }
 
-			// lazy construction of a new set with String representations of the URLs
-			if (classPaths.size() != requiredClasspaths.size() ||
-				!requiredClasspaths.stream().map(URL::toString).collect(Collectors.toSet())
-					.containsAll(classPaths)) {
+        @GuardedBy("lockObject")
+        private void releaseClassLoader() {
+            if (resolvedClassLoader != null) {
+                resolvedClassLoader.releaseClassLoader();
+                resolvedClassLoader = null;
+            }
 
-				throw new IllegalStateException(
-					"The library registration references a different set of library BLOBs than" +
-						" previous registrations for this job:\nold:" +
-						classPaths.toString() +
-						"\nnew:" + requiredClasspaths.toString());
-			}
+            isReleased = true;
+        }
 
-			this.referenceHolders.add(task);
-		}
+        @GuardedBy("lockObject")
+        private void verifyIsNotReleased() {
+            Preconditions.checkState(
+                    !isReleased, "The LibraryCacheEntry has already been released.");
+        }
+    }
 
-		public boolean unregister(ExecutionAttemptID task) {
-			referenceHolders.remove(task);
-			return referenceHolders.isEmpty();
-		}
+    private static final class DefaultClassLoaderLease
+            implements LibraryCacheManager.ClassLoaderLease {
 
-		int getNumberOfReferenceHolders() {
-			return referenceHolders.size();
-		}
+        private final LibraryCacheEntry libraryCacheEntry;
 
-		/**
-		 * Release the class loader to ensure any file descriptors are closed
-		 * and the cached libraries are deleted immediately.
-		 */
-		void releaseClassLoader() {
-			try {
-				classLoader.close();
-			} catch (IOException e) {
-				LOG.warn("Failed to release user code class loader for " + Arrays.toString(libraries.toArray()));
-			}
-		}
-	}
+        private boolean isClosed;
+
+        private DefaultClassLoaderLease(LibraryCacheEntry libraryCacheEntry) {
+            this.libraryCacheEntry = libraryCacheEntry;
+            this.isClosed = false;
+        }
+
+        @Override
+        public UserCodeClassLoader getOrResolveClassLoader(
+                Collection<PermanentBlobKey> requiredJarFiles, Collection<URL> requiredClasspaths)
+                throws IOException {
+            verifyIsNotClosed();
+            return libraryCacheEntry.getOrResolveClassLoader(requiredJarFiles, requiredClasspaths);
+        }
+
+        private void verifyIsNotClosed() {
+            Preconditions.checkState(!isClosed, "The ClassLoaderHandler has already been closed.");
+        }
+
+        @Override
+        public void release() {
+            if (isClosed) {
+                return;
+            }
+
+            isClosed = true;
+
+            libraryCacheEntry.release();
+        }
+
+        private static DefaultClassLoaderLease create(LibraryCacheEntry libraryCacheEntry) {
+            return new DefaultClassLoaderLease(libraryCacheEntry);
+        }
+    }
+
+    private static final class ResolvedClassLoader implements UserCodeClassLoader {
+        private final ClassLoader classLoader;
+
+        /**
+         * Set of BLOB keys used for a previous job/task registration, kept for error messages and
+         * logging only. Later registrations are checked against {@link #libraryHashes}.
+         */
+        private final Set<PermanentBlobKey> libraries;
+
+        /**
+         * Content hashes of {@link #libraries}.
+         *
+         * <p>The purpose of this is to make sure, future registrations do not differ in content as
+         * this is a contract of the {@link BlobLibraryCacheManager}.
+         *
+         * <p>A {@link PermanentBlobKey} contains a random component on top of the content hash (see
+         * FLINK-7140), so the same JAR uploaded twice yields two unequal keys. Comparing content
+         * hashes instead of whole keys keeps the contract check meaningful while tolerating the
+         * re-upload of unchanged JARs that happens when a JobManager fails over (FLINK-32212).
+         *
+         * <p>Note that this compares the set of distinct contents, so a registration that only adds
+         * or drops a duplicate of a JAR already in the required library set is accepted: the
+         * resolved class loader can serve it either way.
+         */
+        private final Set<String> libraryHashes;
+
+        /**
+         * Set of class path URLs used for a previous job/task registration.
+         *
+         * <p>The purpose of this is to make sure, future registrations do not differ in content as
+         * this is a contract of the {@link BlobLibraryCacheManager}.
+         */
+        private final Set<String> classPaths;
+
+        private final boolean wrapsSystemClassLoader;
+
+        private final Map<String, Runnable> releaseHooks;
+
+        private ResolvedClassLoader(
+                ClassLoader classLoader,
+                Collection<PermanentBlobKey> requiredLibraries,
+                Collection<URL> requiredClassPaths,
+                boolean wrapsSystemClassLoader) {
+            this.classLoader = classLoader;
+
+            // NOTE: do not store the class paths, i.e. URLs, into a set for performance reasons
+            //       see http://findbugs.sourceforge.net/bugDescriptions.html#DMI_COLLECTION_OF_URLS
+            //       -> alternatively, compare their string representation
+            this.classPaths = CollectionUtil.newHashSetWithExpectedSize(requiredClassPaths.size());
+            for (URL url : requiredClassPaths) {
+                classPaths.add(url.toString());
+            }
+            this.libraries = new HashSet<>(requiredLibraries);
+            this.libraryHashes = hashesOf(requiredLibraries);
+            this.wrapsSystemClassLoader = wrapsSystemClassLoader;
+
+            this.releaseHooks = new HashMap<>();
+        }
+
+        @Override
+        public ClassLoader asClassLoader() {
+            return classLoader;
+        }
+
+        @Override
+        public void registerReleaseHookIfAbsent(String releaseHookName, Runnable releaseHook) {
+            releaseHooks.putIfAbsent(releaseHookName, releaseHook);
+        }
+
+        private void verifyClassLoader(
+                Collection<PermanentBlobKey> requiredLibraries,
+                Collection<URL> requiredClassPaths) {
+            // Make sure the previous registration referred to the same libraries and class paths.
+
+            // Libraries are compared by BLOB content rather than by key, see #libraryHashes.
+            final Set<String> requiredLibraryHashes = hashesOf(requiredLibraries);
+            if (!libraryHashes.equals(requiredLibraryHashes)) {
+                throw new IllegalStateException(
+                        "The library registration references a different set of library BLOB"
+                                + " contents than previous registrations for this job:\nold:"
+                                + libraries
+                                + " (contents: "
+                                + libraryHashes
+                                + ")\nnew:"
+                                + requiredLibraries
+                                + " (contents: "
+                                + requiredLibraryHashes
+                                + ")");
+            }
+
+            // NOTE: the original collection may contain duplicates and may not already be a Set
+            //       collection with fast checks whether an item is contained in it.
+            // lazy construction of a new set with String representations of the URLs
+            if (classPaths.size() != requiredClassPaths.size()
+                    || !requiredClassPaths.stream()
+                            .map(URL::toString)
+                            .collect(Collectors.toSet())
+                            .containsAll(classPaths)) {
+
+                throw new IllegalStateException(
+                        "The library registration references a different set of class paths than"
+                                + " previous registrations for this job:\nold:"
+                                + classPaths
+                                + "\nnew:"
+                                + requiredClassPaths);
+            }
+        }
+
+        private static Set<String> hashesOf(Collection<PermanentBlobKey> libraries) {
+            final Set<String> hashes = CollectionUtil.newHashSetWithExpectedSize(libraries.size());
+            for (PermanentBlobKey library : libraries) {
+                hashes.add(StringUtils.byteToHexString(library.getHash()));
+            }
+            return hashes;
+        }
+
+        /**
+         * Release the class loader to ensure any file descriptors are closed and the cached
+         * libraries are deleted immediately.
+         */
+        private void releaseClassLoader() {
+            runReleaseHooks();
+
+            if (!wrapsSystemClassLoader) {
+                try {
+                    ((Closeable) classLoader).close();
+                } catch (IOException e) {
+                    LOG.warn(
+                            "Failed to release user code class loader for "
+                                    + Arrays.toString(libraries.toArray()));
+                }
+            }
+            // clear potential references to user-classes in the singleton cache
+            TypeFactory.defaultInstance().clearCache();
+        }
+
+        private void runReleaseHooks() {
+            Set<Map.Entry<String, Runnable>> hooks = releaseHooks.entrySet();
+            if (!hooks.isEmpty()) {
+                for (Map.Entry<String, Runnable> hookEntry : hooks) {
+                    try {
+                        LOG.debug("Running class loader shutdown hook: {}.", hookEntry.getKey());
+                        hookEntry.getValue().run();
+                    } catch (Throwable t) {
+                        LOG.warn(
+                                "Failed to run release hook '{}' for user code class loader.",
+                                hookEntry.getValue(),
+                                t);
+                    }
+                }
+
+                releaseHooks.clear();
+            }
+        }
+    }
 }

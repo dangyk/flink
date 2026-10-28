@@ -18,138 +18,161 @@
 
 package org.apache.flink.state.api.output;
 
-import org.apache.flink.api.common.JobID;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.execution.CheckpointingMode;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.core.fs.Path;
-import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.SavepointType;
+import org.apache.flink.runtime.checkpoint.SnapshotType;
 import org.apache.flink.runtime.jobgraph.OperatorID;
-import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
-import org.apache.flink.runtime.state.ttl.mock.MockStateBackend;
-import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-/**
- * Tests that snapshot utils can properly snapshot an operator.
- */
-public class SnapshotUtilsTest {
+import static org.assertj.core.api.Assertions.assertThat;
 
-	private static final List<String> EXPECTED_CALL_OPERATOR_SNAPSHOT = Arrays.asList(
-		"prepareSnapshotPreBarrier",
-		"snapshotState",
-		"notifyCheckpointComplete");
+/** Tests that snapshot utils can properly snapshot an operator. */
+class SnapshotUtilsTest {
 
-	@Rule
-	public TemporaryFolder folder = new TemporaryFolder();
+    private static final List<String> EXPECTED_CALL_OPERATOR_SNAPSHOT =
+            Arrays.asList("prepareSnapshotPreBarrier", "snapshotState", "notifyCheckpointComplete");
 
-	private static final List<String> ACTUAL_ORDER_TRACKING =
-		Collections.synchronizedList(new ArrayList<>(EXPECTED_CALL_OPERATOR_SNAPSHOT.size()));
+    @TempDir private File folder;
 
-	@Test
-	public void testSnapshotUtilsLifecycle() throws Exception {
-		StreamOperator<Void> operator 		= new LifecycleOperator();
-		CheckpointStorageWorkerView storage = new MockStateBackend().createCheckpointStorage(new JobID());
+    private static final List<String> ACTUAL_ORDER_TRACKING =
+            Collections.synchronizedList(new ArrayList<>(EXPECTED_CALL_OPERATOR_SNAPSHOT.size()));
 
-		Path path = new Path(folder.newFolder().getAbsolutePath());
+    private static SnapshotType actualSnapshotType;
 
-		SnapshotUtils.snapshot(operator, 0, 0L, storage, path);
+    @Test
+    void testSnapshotUtilsLifecycleWithDefaultSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.DEFAULT);
+    }
 
-		Assert.assertEquals(EXPECTED_CALL_OPERATOR_SNAPSHOT, ACTUAL_ORDER_TRACKING);
-	}
+    @Test
+    void testSnapshotUtilsLifecycleWithCanonicalSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.CANONICAL);
+    }
 
-	private static class LifecycleOperator implements StreamOperator<Void> {
-		private static final long serialVersionUID = 1L;
+    @Test
+    void testSnapshotUtilsLifecycleWithNativeSavepointFormatType() throws Exception {
+        testSnapshotUtilsLifecycleWithSavepointFormatType(SavepointFormatType.NATIVE);
+    }
 
-		@Override
-		public void open() throws Exception {
-			ACTUAL_ORDER_TRACKING.add("open");
-		}
+    private void testSnapshotUtilsLifecycleWithSavepointFormatType(
+            SavepointFormatType savepointFormatType) throws Exception {
+        ACTUAL_ORDER_TRACKING.clear();
+        StreamOperator<Void> operator = new LifecycleOperator();
+        Path path = new Path(folder.getAbsolutePath());
 
-		@Override
-		public void close() throws Exception {
-			ACTUAL_ORDER_TRACKING.add("close");
-		}
+        SnapshotUtils.snapshot(
+                0L,
+                operator,
+                0,
+                0L,
+                CheckpointingMode.EXACTLY_ONCE,
+                false,
+                new Configuration(),
+                path,
+                savepointFormatType);
 
-		@Override
-		public void dispose() throws Exception {
-			ACTUAL_ORDER_TRACKING.add("dispose");
-		}
+        assertThat(actualSnapshotType).isEqualTo(SavepointType.savepoint(savepointFormatType));
+        assertThat(ACTUAL_ORDER_TRACKING).isEqualTo(EXPECTED_CALL_OPERATOR_SNAPSHOT);
+    }
 
-		@Override
-		public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
-			ACTUAL_ORDER_TRACKING.add("prepareSnapshotPreBarrier");
-		}
+    private static class LifecycleOperator implements StreamOperator<Void> {
+        private static final long serialVersionUID = 1L;
 
-		@Override
-		public OperatorSnapshotFutures snapshotState(long checkpointId, long timestamp, CheckpointOptions checkpointOptions, CheckpointStreamFactory storageLocation) throws Exception {
-			ACTUAL_ORDER_TRACKING.add("snapshotState");
-			return new OperatorSnapshotFutures();
-		}
+        @Override
+        public void open() throws Exception {
+            ACTUAL_ORDER_TRACKING.add("open");
+        }
 
-		@Override
-		public void initializeState() throws Exception {
-			ACTUAL_ORDER_TRACKING.add("initializeState");
-		}
+        @Override
+        public void finish() throws Exception {
+            ACTUAL_ORDER_TRACKING.add("finish");
+        }
 
-		@Override
-		public void setKeyContextElement1(StreamRecord<?> record) throws Exception {
-			ACTUAL_ORDER_TRACKING.add("setKeyContextElement1");
-		}
+        @Override
+        public void close() throws Exception {
+            ACTUAL_ORDER_TRACKING.add("close");
+        }
 
-		@Override
-		public void setKeyContextElement2(StreamRecord<?> record) throws Exception {
-			ACTUAL_ORDER_TRACKING.add("setKeyContextElement2");
-		}
+        @Override
+        public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+            ACTUAL_ORDER_TRACKING.add("prepareSnapshotPreBarrier");
+        }
 
-		@Override
-		public ChainingStrategy getChainingStrategy() {
-			ACTUAL_ORDER_TRACKING.add("getChainingStrategy");
-			return null;
-		}
+        @Override
+        public OperatorSnapshotFutures snapshotState(
+                long checkpointId,
+                long timestamp,
+                CheckpointOptions checkpointOptions,
+                CheckpointStreamFactory storageLocation)
+                throws Exception {
+            ACTUAL_ORDER_TRACKING.add("snapshotState");
+            actualSnapshotType = checkpointOptions.getCheckpointType();
+            return new OperatorSnapshotFutures();
+        }
 
-		@Override
-		public void setChainingStrategy(ChainingStrategy strategy) {
-			ACTUAL_ORDER_TRACKING.add("setChainingStrategy");
-		}
+        @Override
+        public void initializeState(StreamTaskStateInitializer streamTaskStateManager)
+                throws Exception {
+            ACTUAL_ORDER_TRACKING.add("initializeState");
+        }
 
-		@Override
-		public MetricGroup getMetricGroup() {
-			ACTUAL_ORDER_TRACKING.add("getMetricGroup");
-			return null;
-		}
+        @Override
+        public void setKeyContextElement1(StreamRecord<?> record) throws Exception {
+            ACTUAL_ORDER_TRACKING.add("setKeyContextElement1");
+        }
 
-		@Override
-		public OperatorID getOperatorID() {
-			ACTUAL_ORDER_TRACKING.add("getOperatorID");
-			return null;
-		}
+        @Override
+        public void setKeyContextElement2(StreamRecord<?> record) throws Exception {
+            ACTUAL_ORDER_TRACKING.add("setKeyContextElement2");
+        }
 
-		@Override
-		public void notifyCheckpointComplete(long checkpointId) throws Exception {
-			ACTUAL_ORDER_TRACKING.add("notifyCheckpointComplete");
-		}
+        @Override
+        public OperatorMetricGroup getMetricGroup() {
+            ACTUAL_ORDER_TRACKING.add("getMetricGroup");
+            return null;
+        }
 
-		@Override
-		public void setCurrentKey(Object key) {
-			ACTUAL_ORDER_TRACKING.add("setCurrentKey");
-		}
+        @Override
+        public OperatorID getOperatorID() {
+            ACTUAL_ORDER_TRACKING.add("getOperatorID");
+            return null;
+        }
 
-		@Override
-		public Object getCurrentKey() {
-			ACTUAL_ORDER_TRACKING.add("getCurrentKey");
-			return null;
-		}
-	}
+        @Override
+        public void notifyCheckpointComplete(long checkpointId) throws Exception {
+            ACTUAL_ORDER_TRACKING.add("notifyCheckpointComplete");
+        }
+
+        @Override
+        public void notifyCheckpointAborted(long checkpointId) {}
+
+        @Override
+        public void setCurrentKey(Object key) {
+            ACTUAL_ORDER_TRACKING.add("setCurrentKey");
+        }
+
+        @Override
+        public Object getCurrentKey() {
+            ACTUAL_ORDER_TRACKING.add("getCurrentKey");
+            return null;
+        }
+    }
 }

@@ -21,6 +21,8 @@ package org.apache.flink.state.api.output.operators;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.state.BroadcastState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.state.api.functions.BroadcastStateBootstrapFunction;
 import org.apache.flink.state.api.output.SnapshotUtils;
@@ -38,68 +40,79 @@ import org.apache.flink.util.FlinkRuntimeException;
  */
 @Internal
 public class BroadcastStateBootstrapOperator<IN>
-	extends AbstractUdfStreamOperator<TaggedOperatorSubtaskState, BroadcastStateBootstrapFunction<IN>>
-	implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>,
-	BoundedOneInput {
+        extends AbstractUdfStreamOperator<
+                TaggedOperatorSubtaskState, BroadcastStateBootstrapFunction<IN>>
+        implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>, BoundedOneInput {
 
-	private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 1L;
 
-	private final long timestamp;
+    private final long checkpointId;
 
-	private final Path savepointPath;
+    private final long timestamp;
 
-	private transient ContextImpl context;
+    private final Path savepointPath;
 
-	public BroadcastStateBootstrapOperator(long timestamp, Path savepointPath, BroadcastStateBootstrapFunction<IN> function) {
-		super(function);
-		this.timestamp = timestamp;
+    private transient ContextImpl context;
 
-		this.savepointPath = savepointPath;
-	}
+    public BroadcastStateBootstrapOperator(
+            long checkpointId,
+            long timestamp,
+            Path savepointPath,
+            BroadcastStateBootstrapFunction<IN> function) {
+        super(function);
 
-	@Override
-	public void open() throws Exception {
-		super.open();
-		context = new ContextImpl(getProcessingTimeService());
-	}
+        this.checkpointId = checkpointId;
+        this.timestamp = timestamp;
+        this.savepointPath = savepointPath;
+    }
 
-	@Override
-	public void processElement(StreamRecord<IN> element) throws Exception {
-		userFunction.processElement(element.getValue(), context);
-	}
+    @Override
+    public void open() throws Exception {
+        super.open();
+        context = new ContextImpl(getProcessingTimeService());
+    }
 
-	@Override
-	public void endInput() throws Exception {
-		TaggedOperatorSubtaskState state = SnapshotUtils.snapshot(
-			this,
-			getRuntimeContext().getIndexOfThisSubtask(),
-			timestamp,
-			getContainingTask().getCheckpointStorage(),
-			savepointPath);
+    @Override
+    public void processElement(StreamRecord<IN> element) throws Exception {
+        userFunction.processElement(element.getValue(), context);
+    }
 
-		output.collect(new StreamRecord<>(state));
-	}
+    @Override
+    public void endInput() throws Exception {
+        Configuration jobConf = getContainingTask().getJobConfiguration();
+        TaggedOperatorSubtaskState state =
+                SnapshotUtils.snapshot(
+                        checkpointId,
+                        this,
+                        getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                        timestamp,
+                        CheckpointingOptions.getCheckpointingMode(jobConf),
+                        CheckpointingOptions.isUnalignedCheckpointEnabled(jobConf),
+                        getContainingTask().getConfiguration().getConfiguration(),
+                        savepointPath);
 
-	private class ContextImpl implements BroadcastStateBootstrapFunction.Context {
-		private final ProcessingTimeService processingTimeService;
+        output.collect(new StreamRecord<>(state));
+    }
 
-		ContextImpl(ProcessingTimeService processingTimeService) {
-			this.processingTimeService = processingTimeService;
-		}
+    private class ContextImpl implements BroadcastStateBootstrapFunction.Context {
+        private final ProcessingTimeService processingTimeService;
 
-		@Override
-		public long currentProcessingTime() {
-			return processingTimeService.getCurrentProcessingTime();
-		}
+        ContextImpl(ProcessingTimeService processingTimeService) {
+            this.processingTimeService = processingTimeService;
+        }
 
-		@Override
-		public <K, V> BroadcastState<K, V> getBroadcastState(MapStateDescriptor<K, V> descriptor) {
-			try {
-				return getOperatorStateBackend().getBroadcastState(descriptor);
-			} catch (Exception e) {
-				throw new FlinkRuntimeException(e);
-			}
-		}
-	}
+        @Override
+        public long currentProcessingTime() {
+            return processingTimeService.getCurrentProcessingTime();
+        }
+
+        @Override
+        public <K, V> BroadcastState<K, V> getBroadcastState(MapStateDescriptor<K, V> descriptor) {
+            try {
+                return getOperatorStateBackend().getBroadcastState(descriptor);
+            } catch (Exception e) {
+                throw new FlinkRuntimeException(e);
+            }
+        }
+    }
 }
-

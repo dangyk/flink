@@ -18,7 +18,9 @@
 
 package org.apache.flink.runtime.rest.messages.json;
 
+import org.apache.flink.api.common.ApplicationID;
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.util.OptionalFailure;
@@ -49,120 +51,148 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 public class JobResultDeserializer extends StdDeserializer<JobResult> {
 
-	private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 1L;
 
-	private final JobIDDeserializer jobIdDeserializer = new JobIDDeserializer();
+    private final JobIDDeserializer jobIdDeserializer = new JobIDDeserializer();
 
-	private final SerializedThrowableDeserializer serializedThrowableDeserializer =
-		new SerializedThrowableDeserializer();
+    private final ApplicationIDDeserializer applicationIdDeserializer =
+            new ApplicationIDDeserializer();
 
-	private final SerializedValueDeserializer serializedValueDeserializer;
+    private final SerializedThrowableDeserializer serializedThrowableDeserializer =
+            new SerializedThrowableDeserializer();
 
-	public JobResultDeserializer() {
-		super(JobResult.class);
-		final JavaType objectSerializedValueType = TypeFactory.defaultInstance()
-			.constructType(new TypeReference<SerializedValue<Object>>() {
-			});
-		serializedValueDeserializer = new SerializedValueDeserializer(objectSerializedValueType);
-	}
+    private final SerializedValueDeserializer serializedValueDeserializer;
 
-	@Override
-	public JobResult deserialize(final JsonParser p, final DeserializationContext ctxt) throws IOException {
-		JobID jobId = null;
-		ApplicationStatus applicationStatus = ApplicationStatus.UNKNOWN;
-		long netRuntime = -1;
-		SerializedThrowable serializedThrowable = null;
-		Map<String, SerializedValue<OptionalFailure<Object>>> accumulatorResults = null;
+    public JobResultDeserializer() {
+        super(JobResult.class);
+        final JavaType objectSerializedValueType =
+                TypeFactory.defaultInstance()
+                        .constructType(new TypeReference<SerializedValue<Object>>() {});
+        serializedValueDeserializer = new SerializedValueDeserializer(objectSerializedValueType);
+    }
 
-		while (true) {
-			final JsonToken jsonToken = p.nextToken();
-			assertNotEndOfInput(p, jsonToken);
-			if (jsonToken == JsonToken.END_OBJECT) {
-				break;
-			}
+    @Override
+    public JobResult deserialize(final JsonParser p, final DeserializationContext ctxt)
+            throws IOException {
+        JobID jobId = null;
+        String jobName = "unknown";
+        JobStatus jobStatus = null;
+        long netRuntime = -1;
+        SerializedThrowable serializedThrowable = null;
+        Map<String, SerializedValue<OptionalFailure<Object>>> accumulatorResults = null;
+        ApplicationID applicationId = null;
+        long startTime = -1;
+        long endTime = -1;
 
-			final String fieldName = p.getValueAsString();
-			switch (fieldName) {
-				case JobResultSerializer.FIELD_NAME_JOB_ID:
-					assertNextToken(p, JsonToken.VALUE_STRING);
-					jobId = jobIdDeserializer.deserialize(p, ctxt);
-					break;
-				case JobResultSerializer.FIELD_NAME_APPLICATION_STATUS:
-					assertNextToken(p, JsonToken.VALUE_STRING);
-					applicationStatus = ApplicationStatus.valueOf(p.getValueAsString().toUpperCase());
-					break;
-				case JobResultSerializer.FIELD_NAME_NET_RUNTIME:
-					assertNextToken(p, JsonToken.VALUE_NUMBER_INT);
-					netRuntime = p.getLongValue();
-					break;
-				case JobResultSerializer.FIELD_NAME_ACCUMULATOR_RESULTS:
-					assertNextToken(p, JsonToken.START_OBJECT);
-					accumulatorResults = parseAccumulatorResults(p, ctxt);
-					break;
-				case JobResultSerializer.FIELD_NAME_FAILURE_CAUSE:
-					assertNextToken(p, JsonToken.START_OBJECT);
-					serializedThrowable = serializedThrowableDeserializer.deserialize(p, ctxt);
-					break;
-				default:
-					// ignore unknown fields
-			}
-		}
+        while (true) {
+            final JsonToken jsonToken = p.nextToken();
+            assertNotEndOfInput(p, jsonToken);
+            if (jsonToken == JsonToken.END_OBJECT) {
+                break;
+            }
 
-		try {
-			return new JobResult.Builder()
-				.jobId(jobId)
-				.applicationStatus(applicationStatus)
-				.netRuntime(netRuntime)
-				.accumulatorResults(accumulatorResults)
-				.serializedThrowable(serializedThrowable)
-				.build();
-		} catch (final RuntimeException e) {
-			throw new JsonMappingException(
-				null,
-				"Could not deserialize " + JobResult.class.getSimpleName(),
-				e);
-		}
-	}
+            final String fieldName = p.getValueAsString();
+            switch (fieldName) {
+                case JobResultSerializer.FIELD_NAME_JOB_ID:
+                    assertNextToken(p, JsonToken.VALUE_STRING);
+                    jobId = jobIdDeserializer.deserialize(p, ctxt);
+                    break;
+                case JobResultSerializer.FIELD_NAME_JOB_NAME:
+                    assertNextToken(p, JsonToken.VALUE_STRING);
+                    jobName = p.getValueAsString();
+                    break;
+                case JobResultSerializer.FIELD_NAME_APPLICATION_STATUS:
+                    assertNextToken(p, JsonToken.VALUE_STRING);
+                    try {
+                        jobStatus =
+                                ApplicationStatus.valueOf(p.getValueAsString().toUpperCase())
+                                        .deriveJobStatus();
+                    } catch (UnsupportedOperationException e) {
+                        // jobStatus = null to indicate that the job status is unknown
+                    }
+                    break;
+                case JobResultSerializer.FIELD_NAME_NET_RUNTIME:
+                    assertNextToken(p, JsonToken.VALUE_NUMBER_INT);
+                    netRuntime = p.getLongValue();
+                    break;
+                case JobResultSerializer.FIELD_NAME_ACCUMULATOR_RESULTS:
+                    assertNextToken(p, JsonToken.START_OBJECT);
+                    accumulatorResults = parseAccumulatorResults(p, ctxt);
+                    break;
+                case JobResultSerializer.FIELD_NAME_FAILURE_CAUSE:
+                    assertNextToken(p, JsonToken.START_OBJECT);
+                    serializedThrowable = serializedThrowableDeserializer.deserialize(p, ctxt);
+                    break;
+                case JobResultSerializer.FIELD_NAME_APPLICATION_ID:
+                    assertNextToken(p, JsonToken.VALUE_STRING);
+                    applicationId = applicationIdDeserializer.deserialize(p, ctxt);
+                    break;
+                case JobResultSerializer.FIELD_NAME_START_TIME:
+                    assertNextToken(p, JsonToken.VALUE_NUMBER_INT);
+                    startTime = p.getLongValue();
+                    break;
+                case JobResultSerializer.FIELD_NAME_END_TIME:
+                    assertNextToken(p, JsonToken.VALUE_NUMBER_INT);
+                    endTime = p.getLongValue();
+                    break;
+                default:
+                    // ignore unknown fields
+            }
+        }
 
-	@SuppressWarnings("unchecked")
-	private Map<String, SerializedValue<OptionalFailure<Object>>> parseAccumulatorResults(
-			final JsonParser p,
-			final DeserializationContext ctxt) throws IOException {
+        try {
+            return new JobResult.Builder()
+                    .jobId(jobId)
+                    .jobName(jobName)
+                    .jobStatus(jobStatus)
+                    .netRuntime(netRuntime)
+                    .accumulatorResults(accumulatorResults)
+                    .serializedThrowable(serializedThrowable)
+                    .applicationId(applicationId)
+                    .startTime(startTime)
+                    .endTime(endTime)
+                    .build();
+        } catch (final RuntimeException e) {
+            throw new JsonMappingException(
+                    null, "Could not deserialize " + JobResult.class.getSimpleName(), e);
+        }
+    }
 
-		final Map<String, SerializedValue<OptionalFailure<Object>>> accumulatorResults = new HashMap<>();
-		while (true) {
-			final JsonToken jsonToken = p.nextToken();
-			assertNotEndOfInput(p, jsonToken);
-			if (jsonToken == JsonToken.END_OBJECT) {
-				break;
-			}
-			final String accumulatorName = p.getValueAsString();
-			p.nextValue();
-			accumulatorResults.put(
-				accumulatorName,
-				(SerializedValue<OptionalFailure<Object>>) serializedValueDeserializer.deserialize(p, ctxt));
-		}
-		return accumulatorResults;
-	}
+    @SuppressWarnings("unchecked")
+    private Map<String, SerializedValue<OptionalFailure<Object>>> parseAccumulatorResults(
+            final JsonParser p, final DeserializationContext ctxt) throws IOException {
 
-	/**
-	 * Asserts that the provided JsonToken is not null, i.e., not at the end of the input.
-	 */
-	private static void assertNotEndOfInput(
-			final JsonParser p,
-			@Nullable final JsonToken jsonToken) {
-		checkState(jsonToken != null, "Unexpected end of input at %s", p.getCurrentLocation());
-	}
+        final Map<String, SerializedValue<OptionalFailure<Object>>> accumulatorResults =
+                new HashMap<>();
+        while (true) {
+            final JsonToken jsonToken = p.nextToken();
+            assertNotEndOfInput(p, jsonToken);
+            if (jsonToken == JsonToken.END_OBJECT) {
+                break;
+            }
+            final String accumulatorName = p.getValueAsString();
+            p.nextValue();
+            accumulatorResults.put(
+                    accumulatorName,
+                    (SerializedValue<OptionalFailure<Object>>)
+                            serializedValueDeserializer.deserialize(p, ctxt));
+        }
+        return accumulatorResults;
+    }
 
-	/**
-	 * Advances the token and asserts that it matches the required {@link JsonToken}.
-	 */
-	private static void assertNextToken(
-			final JsonParser p,
-			final JsonToken requiredJsonToken) throws IOException {
-		final JsonToken jsonToken = p.nextToken();
-		if (jsonToken != requiredJsonToken) {
-			throw new JsonMappingException(p, String.format("Expected token %s (was %s)", requiredJsonToken, jsonToken));
-		}
-	}
+    /** Asserts that the provided JsonToken is not null, i.e., not at the end of the input. */
+    private static void assertNotEndOfInput(
+            final JsonParser p, @Nullable final JsonToken jsonToken) {
+        checkState(jsonToken != null, "Unexpected end of input at %s", p.getCurrentLocation());
+    }
+
+    /** Advances the token and asserts that it matches the required {@link JsonToken}. */
+    private static void assertNextToken(final JsonParser p, final JsonToken requiredJsonToken)
+            throws IOException {
+        final JsonToken jsonToken = p.nextToken();
+        if (jsonToken != requiredJsonToken) {
+            throw new JsonMappingException(
+                    p, String.format("Expected token %s (was %s)", requiredJsonToken, jsonToken));
+        }
+    }
 }

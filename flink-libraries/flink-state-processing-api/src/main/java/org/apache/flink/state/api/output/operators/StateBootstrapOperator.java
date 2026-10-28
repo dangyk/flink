@@ -19,6 +19,8 @@
 package org.apache.flink.state.api.output.operators;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.state.api.functions.StateBootstrapFunction;
 import org.apache.flink.state.api.output.SnapshotUtils;
@@ -35,59 +37,69 @@ import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
  */
 @Internal
 public class StateBootstrapOperator<IN>
-	extends AbstractUdfStreamOperator<TaggedOperatorSubtaskState, StateBootstrapFunction<IN>>
-	implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>,
-	BoundedOneInput {
+        extends AbstractUdfStreamOperator<TaggedOperatorSubtaskState, StateBootstrapFunction<IN>>
+        implements OneInputStreamOperator<IN, TaggedOperatorSubtaskState>, BoundedOneInput {
 
-	private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 1L;
 
-	private final long timestamp;
+    private final long checkpointId;
 
-	private final Path savepointPath;
+    private final long timestamp;
 
-	private transient ContextImpl context;
+    private final Path savepointPath;
 
-	public StateBootstrapOperator(long timestamp, Path savepointPath, StateBootstrapFunction<IN> function) {
-		super(function);
+    private transient ContextImpl context;
 
-		this.timestamp = timestamp;
-		this.savepointPath = savepointPath;
-	}
+    public StateBootstrapOperator(
+            long checkpointId,
+            long timestamp,
+            Path savepointPath,
+            StateBootstrapFunction<IN> function) {
+        super(function);
 
-	@Override
-	public void open() throws Exception {
-		super.open();
-		context = new ContextImpl(getProcessingTimeService());
-	}
+        this.checkpointId = checkpointId;
+        this.timestamp = timestamp;
+        this.savepointPath = savepointPath;
+    }
 
-	@Override
-	public void processElement(StreamRecord<IN> element) throws Exception {
-		userFunction.processElement(element.getValue(), context);
-	}
+    @Override
+    public void open() throws Exception {
+        super.open();
+        context = new ContextImpl(getProcessingTimeService());
+    }
 
-	@Override
-	public void endInput() throws Exception {
-		TaggedOperatorSubtaskState state = SnapshotUtils.snapshot(
-			this,
-			getRuntimeContext().getIndexOfThisSubtask(),
-			timestamp,
-			getContainingTask().getCheckpointStorage(),
-			savepointPath);
+    @Override
+    public void processElement(StreamRecord<IN> element) throws Exception {
+        userFunction.processElement(element.getValue(), context);
+    }
 
-		output.collect(new StreamRecord<>(state));
-	}
+    @Override
+    public void endInput() throws Exception {
+        Configuration jobConf = getContainingTask().getJobConfiguration();
+        TaggedOperatorSubtaskState state =
+                SnapshotUtils.snapshot(
+                        checkpointId,
+                        this,
+                        getRuntimeContext().getTaskInfo().getIndexOfThisSubtask(),
+                        timestamp,
+                        CheckpointingOptions.getCheckpointingMode(jobConf),
+                        CheckpointingOptions.isUnalignedCheckpointEnabled(jobConf),
+                        getContainingTask().getConfiguration().getConfiguration(),
+                        savepointPath);
 
-	private class ContextImpl implements StateBootstrapFunction.Context {
-		private final ProcessingTimeService processingTimeService;
+        output.collect(new StreamRecord<>(state));
+    }
 
-		ContextImpl(ProcessingTimeService processingTimeService) {
-			this.processingTimeService = processingTimeService;
-		}
+    private class ContextImpl implements StateBootstrapFunction.Context {
+        private final ProcessingTimeService processingTimeService;
 
-		@Override
-		public long currentProcessingTime() {
-			return processingTimeService.getCurrentProcessingTime();
-		}
-	}
+        ContextImpl(ProcessingTimeService processingTimeService) {
+            this.processingTimeService = processingTimeService;
+        }
+
+        @Override
+        public long currentProcessingTime() {
+            return processingTimeService.getCurrentProcessingTime();
+        }
+    }
 }
-

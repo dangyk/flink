@@ -18,39 +18,60 @@
 
 package org.apache.flink.runtime.blob;
 
+import org.apache.flink.api.common.ApplicationID;
 import org.apache.flink.api.common.JobID;
 
 import java.io.File;
 import java.io.IOException;
 
-/**
- * A blob store doing nothing.
- */
+/** A blob store doing nothing. */
 public class VoidBlobStore implements BlobStoreService {
 
-	@Override
-	public boolean put(File localFile, JobID jobId, BlobKey blobKey) throws IOException {
-		return false;
-	}
+    @Override
+    public boolean put(File localFile, JobID jobId, BlobKey blobKey) throws IOException {
+        return false;
+    }
 
-	@Override
-	public boolean get(JobID jobId, BlobKey blobKey, File localFile) throws IOException {
-		return false;
-	}
+    @Override
+    public boolean get(JobID jobId, BlobKey blobKey, File localFile) throws IOException {
+        return false;
+    }
 
-	@Override
-	public boolean delete(JobID jobId, BlobKey blobKey) {
-		return true;
-	}
+    @Override
+    public boolean delete(JobID jobId, BlobKey blobKey) {
+        return true;
+    }
 
-	@Override
-	public boolean deleteAll(JobID jobId) {
-		return true;
-	}
+    @Override
+    public boolean deleteAll(JobID jobId) {
+        return true;
+    }
 
-	@Override
-	public void closeAndCleanupAllData() {}
+    @Override
+    public boolean put(File localFile, ApplicationID applicationId, BlobKey blobKey)
+            throws IOException {
+        return false;
+    }
 
-	@Override
-	public void close() throws IOException {}
+    @Override
+    public boolean get(ApplicationID applicationId, BlobKey blobKey, File localFile)
+            throws IOException {
+        return false;
+    }
+
+    @Override
+    public boolean delete(ApplicationID applicationId, BlobKey blobKey) {
+        return true;
+    }
+
+    @Override
+    public boolean deleteAll(ApplicationID applicationId) {
+        return true;
+    }
+
+    @Override
+    public void cleanupAllData() {}
+
+    @Override
+    public void close() throws IOException {}
 }

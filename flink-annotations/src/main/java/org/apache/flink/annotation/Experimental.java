@@ -21,20 +21,21 @@ package org.apache.flink.annotation;
 
 import java.lang.annotation.Documented;
 import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
  * Annotation to mark classes for experimental use.
  *
- * <p>Classes with this annotation are neither battle-tested nor stable, and may be changed or removed
- * in future versions.
+ * <p>Classes with this annotation are neither battle-tested nor stable, and may be changed or
+ * removed in future versions.
  *
- * <p>This annotation also excludes classes with evolving interfaces / signatures
- * annotated with {@link Public} and {@link PublicEvolving}.
- *
+ * <p>This annotation also excludes classes with evolving interfaces / signatures annotated with
+ * {@link Public} and {@link PublicEvolving}.
  */
 @Documented
-@Target({ElementType.TYPE, ElementType.METHOD, ElementType.FIELD, ElementType.CONSTRUCTOR })
+@Target({ElementType.TYPE, ElementType.METHOD, ElementType.FIELD, ElementType.CONSTRUCTOR})
 @Public
-public @interface Experimental {
-}
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Experimental {}

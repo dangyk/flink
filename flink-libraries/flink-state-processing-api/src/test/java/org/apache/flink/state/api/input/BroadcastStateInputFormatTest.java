@@ -18,9 +18,11 @@
 
 package org.apache.flink.state.api.input;
 
+import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.checkpoint.OperatorState;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.state.api.input.splits.OperatorStateInputSplit;
@@ -32,70 +34,78 @@ import org.apache.flink.streaming.util.MockStreamingRuntimeContext;
 import org.apache.flink.streaming.util.TwoInputStreamOperatorTestHarness;
 import org.apache.flink.util.Collector;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-/**
- * Test for operator broadcast state input format.
- */
-public class BroadcastStateInputFormatTest {
-	private static MapStateDescriptor<Integer, Integer> descriptor = new MapStateDescriptor<>("state", Types.INT, Types.INT);
+import static org.assertj.core.api.Assertions.assertThat;
 
-	@Test
-	public void testReadBroadcastState() throws Exception {
-		try (TwoInputStreamOperatorTestHarness<Void, Integer, Void> testHarness = getTestHarness()) {
-			testHarness.open();
+/** Test for operator broadcast state input format. */
+class BroadcastStateInputFormatTest {
+    private static MapStateDescriptor<Integer, Integer> descriptor =
+            new MapStateDescriptor<>("state", Types.INT, Types.INT);
 
-			testHarness.processElement2(new StreamRecord<>(1));
-			testHarness.processElement2(new StreamRecord<>(2));
-			testHarness.processElement2(new StreamRecord<>(3));
+    @Test
+    void testReadBroadcastState() throws Exception {
+        try (TwoInputStreamOperatorTestHarness<Void, Integer, Void> testHarness =
+                getTestHarness()) {
+            testHarness.open();
 
-			OperatorSubtaskState subtaskState = testHarness.snapshot(0, 0);
-			OperatorState state = new OperatorState(OperatorIDGenerator.fromUid("uid"), 1, 4);
-			state.putState(0, subtaskState);
+            testHarness.processElement2(new StreamRecord<>(1));
+            testHarness.processElement2(new StreamRecord<>(2));
+            testHarness.processElement2(new StreamRecord<>(3));
 
-			OperatorStateInputSplit split = new OperatorStateInputSplit(subtaskState.getManagedOperatorState(), 0);
+            OperatorSubtaskState subtaskState = testHarness.snapshot(0, 0);
+            OperatorState state =
+                    new OperatorState(null, null, OperatorIDGenerator.fromUid("uid"), 1, 4);
+            state.putState(0, subtaskState);
 
-			BroadcastStateInputFormat<Integer, Integer> format = new BroadcastStateInputFormat<>(state, descriptor);
+            OperatorStateInputSplit split =
+                    new OperatorStateInputSplit(subtaskState.getManagedOperatorState(), 0);
 
-			format.setRuntimeContext(new MockStreamingRuntimeContext(false, 1, 0));
-			format.open(split);
+            BroadcastStateInputFormat<Integer, Integer> format =
+                    new BroadcastStateInputFormat<>(
+                            state, new Configuration(), null, descriptor, new ExecutionConfig());
 
-			Map<Integer, Integer> results = new HashMap<>(3);
+            format.setRuntimeContext(new MockStreamingRuntimeContext(1, 0));
+            format.open(split);
 
-			while (!format.reachedEnd()) {
-				Tuple2<Integer, Integer> entry = format.nextRecord(null);
-				results.put(entry.f0, entry.f1);
-			}
+            Map<Integer, Integer> results = new HashMap<>(3);
 
-			Map<Integer, Integer> expected = new HashMap<>(3);
-			expected.put(1, 1);
-			expected.put(2, 2);
-			expected.put(3, 3);
+            while (!format.reachedEnd()) {
+                Tuple2<Integer, Integer> entry = format.nextRecord(null);
+                results.put(entry.f0, entry.f1);
+            }
 
-			Assert.assertEquals("Failed to read correct list state from state backend", expected, results);
-		}
-	}
+            Map<Integer, Integer> expected = new HashMap<>(3);
+            expected.put(1, 1);
+            expected.put(2, 2);
+            expected.put(3, 3);
 
-	private TwoInputStreamOperatorTestHarness<Void, Integer, Void> getTestHarness() throws Exception {
-		return new TwoInputStreamOperatorTestHarness<>(
-			new CoBroadcastWithNonKeyedOperator<>(
-				new StatefulFunction(), Collections.singletonList(descriptor)));
-	}
+            assertThat(results)
+                    .as("Failed to read correct list state from state backend")
+                    .isEqualTo(expected);
+        }
+    }
 
-	static class StatefulFunction extends BroadcastProcessFunction<Void, Integer, Void> {
+    private TwoInputStreamOperatorTestHarness<Void, Integer, Void> getTestHarness()
+            throws Exception {
+        return new TwoInputStreamOperatorTestHarness<>(
+                new CoBroadcastWithNonKeyedOperator<>(
+                        new StatefulFunction(), Collections.singletonList(descriptor)));
+    }
 
-		@Override
-		public void processElement(Void value, ReadOnlyContext ctx, Collector<Void> out) {}
+    static class StatefulFunction extends BroadcastProcessFunction<Void, Integer, Void> {
 
-		@Override
-		public void processBroadcastElement(Integer value, Context ctx, Collector<Void> out) throws Exception {
-			ctx.getBroadcastState(descriptor).put(value, value);
-		}
-	}
+        @Override
+        public void processElement(Void value, ReadOnlyContext ctx, Collector<Void> out) {}
+
+        @Override
+        public void processBroadcastElement(Integer value, Context ctx, Collector<Void> out)
+                throws Exception {
+            ctx.getBroadcastState(descriptor).put(value, value);
+        }
+    }
 }
-

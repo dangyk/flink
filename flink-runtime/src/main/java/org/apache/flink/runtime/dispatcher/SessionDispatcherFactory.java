@@ -18,24 +18,43 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.runtime.application.AbstractApplication;
+import org.apache.flink.runtime.dispatcher.cleanup.CheckpointResourcesCleanupRunnerFactory;
+import org.apache.flink.runtime.highavailability.ApplicationResult;
+import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.streaming.api.graph.ExecutionPlan;
 
-import javax.annotation.Nonnull;
+import java.util.Collection;
 
-/**
- * {@link DispatcherFactory} which creates a {@link StandaloneDispatcher}.
- */
-public enum SessionDispatcherFactory implements DispatcherFactory<Dispatcher> {
-	INSTANCE;
+/** {@link DispatcherFactory} which creates a {@link StandaloneDispatcher}. */
+public enum SessionDispatcherFactory implements DispatcherFactory {
+    INSTANCE;
 
-	@Override
-	public Dispatcher createDispatcher(
-			@Nonnull RpcService rpcService,
-			@Nonnull PartialDispatcherServices partialDispatcherServices) throws Exception {
-		// create the default dispatcher
-		return new StandaloneDispatcher(
-			rpcService,
-			getEndpointId(),
-			DispatcherServices.from(partialDispatcherServices, DefaultJobManagerRunnerFactory.INSTANCE));
-	}
+    @Override
+    public StandaloneDispatcher createDispatcher(
+            RpcService rpcService,
+            DispatcherId fencingToken,
+            Collection<ExecutionPlan> recoveredJobs,
+            Collection<JobResult> recoveredDirtyJobResults,
+            Collection<AbstractApplication> recoveredApplications,
+            Collection<ApplicationResult> recoveredDirtyApplicationResults,
+            DispatcherBootstrapFactory dispatcherBootstrapFactory,
+            PartialDispatcherServicesWithPersistenceComponents
+                    partialDispatcherServicesWithPersistenceComponents)
+            throws Exception {
+        // create the default dispatcher
+        return new StandaloneDispatcher(
+                rpcService,
+                fencingToken,
+                recoveredJobs,
+                recoveredDirtyJobResults,
+                recoveredApplications,
+                recoveredDirtyApplicationResults,
+                dispatcherBootstrapFactory,
+                DispatcherServices.from(
+                        partialDispatcherServicesWithPersistenceComponents,
+                        JobMasterServiceLeadershipRunnerFactory.INSTANCE,
+                        CheckpointResourcesCleanupRunnerFactory.INSTANCE));
+    }
 }

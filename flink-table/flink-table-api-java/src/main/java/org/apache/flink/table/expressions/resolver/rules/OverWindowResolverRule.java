@@ -19,6 +19,8 @@
 package org.apache.flink.table.expressions.resolver.rules;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.OverWindowRange;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.UnresolvedCallExpression;
@@ -26,120 +28,189 @@ import org.apache.flink.table.expressions.ValueLiteralExpression;
 import org.apache.flink.table.expressions.resolver.LocalOverWindow;
 import org.apache.flink.table.expressions.utils.ApiExpressionDefaultVisitor;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
-import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.types.logical.LogicalType;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import static java.util.Arrays.asList;
-import static org.apache.flink.table.expressions.utils.ApiExpressionUtils.unresolvedCall;
+import static org.apache.flink.table.expressions.ApiExpressionUtils.unresolvedCall;
+import static org.apache.flink.table.expressions.ApiExpressionUtils.valueLiteral;
 import static org.apache.flink.table.types.logical.LogicalTypeRoot.BIGINT;
 import static org.apache.flink.table.types.logical.LogicalTypeRoot.INTERVAL_DAY_TIME;
-import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.hasRoot;
 
 /**
- * Joins call to {@link BuiltInFunctionDefinitions#OVER} with corresponding over window
- * and creates a fully resolved over aggregation.
+ * Joins call to {@link BuiltInFunctionDefinitions#OVER} with corresponding over window and creates
+ * a fully resolved over aggregation.
  */
 @Internal
 final class OverWindowResolverRule implements ResolverRule {
 
-	private static final WindowKindExtractor OVER_WINDOW_KIND_EXTRACTOR = new WindowKindExtractor();
+    private static final WindowKindExtractor OVER_WINDOW_KIND_EXTRACTOR = new WindowKindExtractor();
 
-	@Override
-	public List<Expression> apply(List<Expression> expression, ResolutionContext context) {
-		return expression.stream()
-			.map(expr -> expr.accept(new ExpressionResolverVisitor(context)))
-			.collect(Collectors.toList());
-	}
+    @Override
+    public List<Expression> apply(List<Expression> expression, ResolutionContext context) {
+        return expression.stream()
+                .map(expr -> expr.accept(new ExpressionResolverVisitor(context)))
+                .collect(Collectors.toList());
+    }
 
-	private class ExpressionResolverVisitor extends RuleExpressionVisitor<Expression> {
+    private static class ExpressionResolverVisitor extends RuleExpressionVisitor<Expression> {
 
-		ExpressionResolverVisitor(ResolutionContext context) {
-			super(context);
-		}
+        ExpressionResolverVisitor(ResolutionContext context) {
+            super(context);
+        }
 
-		@Override
-		public Expression visit(UnresolvedCallExpression unresolvedCall) {
+        @Override
+        public Expression visit(UnresolvedCallExpression unresolvedCall) {
 
-			if (unresolvedCall.getFunctionDefinition() == BuiltInFunctionDefinitions.OVER) {
-				List<Expression> children = unresolvedCall.getChildren();
-				Expression alias = children.get(1);
+            if (unresolvedCall.getFunctionDefinition() == BuiltInFunctionDefinitions.OVER) {
+                List<Expression> children = unresolvedCall.getChildren();
 
-				LocalOverWindow referenceWindow = resolutionContext.getOverWindow(alias)
-					.orElseThrow(() -> new ValidationException("Could not resolve over call."));
+                if (children.size() >= 4) {
+                    UnresolvedCallExpression agg = (UnresolvedCallExpression) children.get(0);
+                    List<Expression> expandedChildren = new ArrayList<>(children);
+                    Expression preceding = children.get(2);
+                    Expression following = children.get(3);
 
-				Expression following = calculateOverWindowFollowing(referenceWindow);
-				List<Expression> newArgs = new ArrayList<>(asList(
-					children.get(0),
-					referenceWindow.getOrderBy(),
-					referenceWindow.getPreceding(),
-					following));
+                    if (isLeadOrLag(agg)) {
+                        if (!isNullLiteral(preceding) || !isNullLiteral(following)) {
+                            throw leadLagWithBoundsException();
+                        }
+                    } else if (isNullLiteral(preceding) && isNullLiteral(following)) {
+                        expandedChildren.set(2, valueLiteral(OverWindowRange.UNBOUNDED_RANGE));
+                        expandedChildren.set(3, valueLiteral(OverWindowRange.CURRENT_RANGE));
+                    }
 
-				newArgs.addAll(referenceWindow.getPartitionBy());
+                    return unresolvedCall.replaceArgs(
+                            expandedChildren.stream()
+                                    .map(expr -> expr.accept(this))
+                                    .collect(Collectors.toList()));
+                }
 
-				return unresolvedCall(unresolvedCall.getFunctionDefinition(), newArgs.toArray(new Expression[0]));
-			} else {
-				return unresolvedCall(
-					unresolvedCall.getFunctionDefinition(),
-					unresolvedCall.getChildren().stream()
-						.map(expr -> expr.accept(this))
-						.toArray(Expression[]::new));
-			}
-		}
+                if (children.size() != 2) {
+                    throw new ValidationException(
+                            "An OVER call expects a window alias or an inline window "
+                                    + "specification.");
+                }
 
-		private Expression calculateOverWindowFollowing(LocalOverWindow referenceWindow) {
-			return referenceWindow.getFollowing().orElseGet(() -> {
-					WindowKind kind = referenceWindow.getPreceding().accept(OVER_WINDOW_KIND_EXTRACTOR);
-					if (kind == WindowKind.ROW) {
-						return unresolvedCall(BuiltInFunctionDefinitions.CURRENT_ROW);
-					} else {
-						return unresolvedCall(BuiltInFunctionDefinitions.CURRENT_RANGE);
-					}
-				}
-			);
-		}
+                Expression alias = children.get(1);
 
-		@Override
-		protected Expression defaultMethod(Expression expression) {
-			return expression;
-		}
-	}
+                LocalOverWindow referenceWindow =
+                        resolutionContext
+                                .getOverWindow(alias)
+                                .orElseThrow(
+                                        () ->
+                                                new ValidationException(
+                                                        "Could not resolve over call."));
 
-	private enum WindowKind {
-		ROW,
-		RANGE
-	}
+                UnresolvedCallExpression agg = (UnresolvedCallExpression) children.get(0);
 
-	private static class WindowKindExtractor extends ApiExpressionDefaultVisitor<WindowKind> {
+                final List<Expression> newArgs = new ArrayList<>();
+                newArgs.add(agg);
+                newArgs.add(referenceWindow.getOrderBy());
+                if (isLeadOrLag(agg)) {
+                    if (referenceWindow.getPreceding().isPresent()
+                            || referenceWindow.getFollowing().isPresent()) {
+                        throw leadLagWithBoundsException();
+                    }
+                    newArgs.add(valueLiteral(null, DataTypes.NULL()));
+                    newArgs.add(valueLiteral(null, DataTypes.NULL()));
+                } else {
+                    Expression preceding =
+                            referenceWindow
+                                    .getPreceding()
+                                    .orElse(valueLiteral(OverWindowRange.UNBOUNDED_RANGE));
+                    newArgs.add(preceding);
+                    newArgs.add(calculateOverWindowFollowing(referenceWindow, preceding));
+                }
 
-		@Override
-		public WindowKind visit(ValueLiteralExpression valueLiteral) {
-			final LogicalType literalType = valueLiteral.getOutputDataType().getLogicalType();
-			if (hasRoot(literalType, BIGINT)) {
-				return WindowKind.ROW;
-			} else if (hasRoot(literalType, INTERVAL_DAY_TIME)) {
-				return WindowKind.RANGE;
-			}
-			return defaultMethod(valueLiteral);
-		}
+                newArgs.addAll(referenceWindow.getPartitionBy());
 
-		@Override
-		public WindowKind visit(UnresolvedCallExpression unresolvedCall) {
-			final FunctionDefinition definition = unresolvedCall.getFunctionDefinition();
-			if (definition == BuiltInFunctionDefinitions.UNBOUNDED_ROW) {
-				return WindowKind.ROW;
-			} else if (definition == BuiltInFunctionDefinitions.UNBOUNDED_RANGE) {
-				return WindowKind.RANGE;
-			}
-			return defaultMethod(unresolvedCall);
-		}
+                return unresolvedCall.replaceArgs(newArgs);
+            } else {
+                return unresolvedCall.replaceArgs(
+                        unresolvedCall.getChildren().stream()
+                                .map(expr -> expr.accept(this))
+                                .collect(Collectors.toList()));
+            }
+        }
 
-		@Override
-		protected WindowKind defaultMethod(Expression expression) {
-			throw new ValidationException("An over window expects literal or unbounded bounds for preceding.");
-		}
-	}
+        private static boolean isLeadOrLag(UnresolvedCallExpression aggregate) {
+            return aggregate.getFunctionDefinition() == BuiltInFunctionDefinitions.LAG
+                    || aggregate.getFunctionDefinition() == BuiltInFunctionDefinitions.LEAD;
+        }
+
+        private static boolean isNullLiteral(Expression expression) {
+            return expression instanceof ValueLiteralExpression
+                    && ((ValueLiteralExpression) expression).isNull();
+        }
+
+        private static ValidationException leadLagWithBoundsException() {
+            return new ValidationException(
+                    "LEAD/LAG functions do not support providing RANGE/ROW bounds.");
+        }
+
+        private Expression calculateOverWindowFollowing(
+                LocalOverWindow referenceWindow, Expression preceding) {
+            return referenceWindow
+                    .getFollowing()
+                    .orElseGet(
+                            () -> {
+                                WindowKind kind = preceding.accept(OVER_WINDOW_KIND_EXTRACTOR);
+                                if (kind == WindowKind.ROW) {
+                                    return valueLiteral(OverWindowRange.CURRENT_ROW);
+                                } else {
+                                    return valueLiteral(OverWindowRange.CURRENT_RANGE);
+                                }
+                            });
+        }
+
+        @Override
+        protected Expression defaultMethod(Expression expression) {
+            return expression;
+        }
+    }
+
+    private enum WindowKind {
+        ROW,
+        RANGE
+    }
+
+    private static class WindowKindExtractor extends ApiExpressionDefaultVisitor<WindowKind> {
+
+        @Override
+        public WindowKind visit(ValueLiteralExpression valueLiteral) {
+            final LogicalType literalType = valueLiteral.getOutputDataType().getLogicalType();
+            if (literalType.is(BIGINT)) {
+                return WindowKind.ROW;
+            } else if (literalType.is(INTERVAL_DAY_TIME)) {
+                return WindowKind.RANGE;
+            }
+
+            return valueLiteral
+                    .getValueAs(OverWindowRange.class)
+                    .map(
+                            v -> {
+                                switch (v) {
+                                    case CURRENT_ROW:
+                                    case UNBOUNDED_ROW:
+                                        return WindowKind.ROW;
+                                    case CURRENT_RANGE:
+                                    case UNBOUNDED_RANGE:
+                                        return WindowKind.RANGE;
+                                    default:
+                                        throw new IllegalArgumentException(
+                                                "Unexpected window range: " + v);
+                                }
+                            })
+                    .orElseGet(() -> defaultMethod(valueLiteral));
+        }
+
+        @Override
+        protected WindowKind defaultMethod(Expression expression) {
+            throw new ValidationException(
+                    "An over window expects literal or unbounded bounds for preceding.");
+        }
+    }
 }

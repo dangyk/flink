@@ -19,64 +19,124 @@
 
 package org.apache.flink.test.example.client;
 
-import org.apache.flink.api.common.ExecutionConfig;
-import org.apache.flink.api.common.Plan;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.client.LocalExecutor;
+import org.apache.flink.client.deployment.executors.LocalExecutor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.minicluster.MiniCluster;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.legacy.OutputFormatSinkFunction;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.streaming.api.graph.StreamGraph;
+import org.apache.flink.streaming.api.legacy.io.TextInputFormat;
+import org.apache.flink.streaming.api.legacy.io.TextOutputFormat;
 import org.apache.flink.test.testdata.WordCountData;
 import org.apache.flink.test.testfunctions.Tokenizer;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.util.concurrent.TimeUnit;
 
-/**
- * Integration tests for {@link LocalExecutor}.
- */
-public class LocalExecutorITCase extends TestLogger {
+import static org.apache.flink.core.testutils.CommonTestUtils.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
 
-	private static final int parallelism = 4;
+/** Integration tests for {@link LocalExecutor}. */
+@ExtendWith(TestLoggerExtension.class)
+class LocalExecutorITCase {
 
-	@Test
-	public void testLocalExecutorWithWordCount() {
-		try {
-			// set up the files
-			File inFile = File.createTempFile("wctext", ".in");
-			File outFile = File.createTempFile("wctext", ".out");
-			inFile.deleteOnExit();
-			outFile.deleteOnExit();
+    private static final int parallelism = 4;
 
-			try (FileWriter fw = new FileWriter(inFile)) {
-				fw.write(WordCountData.TEXT);
-			}
+    private MiniCluster miniCluster;
+    private LocalExecutor executor;
 
-			final Configuration config = new Configuration();
-			config.setBoolean(CoreOptions.FILESYTEM_DEFAULT_OVERRIDE, true);
+    @BeforeEach
+    void before() {
+        executor =
+                LocalExecutor.createWithFactory(
+                        new Configuration(),
+                        config -> {
+                            miniCluster = new MiniCluster(config);
+                            return miniCluster;
+                        });
+    }
 
-			final LocalExecutor executor = new LocalExecutor(config);
+    @Test
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    void testLocalExecutorWithWordCount() throws Exception {
+        // set up the files
+        File inFile = File.createTempFile("wctext", ".in");
+        File outFile = File.createTempFile("wctext", ".out");
+        inFile.deleteOnExit();
+        outFile.deleteOnExit();
 
-			Plan wcPlan = getWordCountPlan(inFile, outFile, parallelism);
-			wcPlan.setExecutionConfig(new ExecutionConfig());
-			executor.executePlan(wcPlan);
-		} catch (Exception e) {
-			e.printStackTrace();
-			Assert.fail(e.getMessage());
-		}
-	}
+        try (FileWriter fw = new FileWriter(inFile)) {
+            fw.write(WordCountData.TEXT);
+        }
 
-	private Plan getWordCountPlan(File inFile, File outFile, int parallelism) {
-		ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-		env.setParallelism(parallelism);
-		env.readTextFile(inFile.getAbsolutePath())
-			.flatMap(new Tokenizer())
-			.groupBy(0)
-			.sum(1)
-			.writeAsCsv(outFile.getAbsolutePath());
-		return env.createProgramPlan();
-	}
+        final Configuration config = new Configuration();
+        config.set(CoreOptions.FILESYTEM_DEFAULT_OVERRIDE, true);
+        config.set(DeploymentOptions.ATTACHED, true);
+
+        StreamGraph wcStreamGraph = getWordCountStreamGraph(inFile, outFile, parallelism);
+        JobClient jobClient =
+                executor.execute(wcStreamGraph, config, ClassLoader.getSystemClassLoader()).get();
+        jobClient.getJobExecutionResult().get();
+
+        assertThat(miniCluster.isRunning()).isFalse();
+    }
+
+    @Test
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    public void testMiniClusterShutdownOnErrors() throws Exception {
+        StreamGraph runtimeExceptionPlan = getRuntimeExceptionPlan();
+
+        Configuration config = new Configuration();
+        config.set(DeploymentOptions.ATTACHED, true);
+
+        JobClient jobClient =
+                executor.execute(runtimeExceptionPlan, config, ClassLoader.getSystemClassLoader())
+                        .get();
+
+        assertThrows(
+                "Job execution failed.",
+                Exception.class,
+                () -> jobClient.getJobExecutionResult().get());
+
+        assertThat(miniCluster.isRunning()).isFalse();
+    }
+
+    private StreamGraph getWordCountStreamGraph(File inFile, File outFile, int parallelism) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(parallelism);
+        env.createInput(new TextInputFormat(new Path(inFile.getAbsolutePath())))
+                .flatMap(new Tokenizer())
+                .keyBy(x -> x.f0)
+                .sum(1)
+                .addSink(
+                        new OutputFormatSinkFunction<>(
+                                new TextOutputFormat<>(new Path(outFile.getAbsolutePath()))));
+        return env.getStreamGraph();
+    }
+
+    private StreamGraph getRuntimeExceptionPlan() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.fromData(1)
+                .map(
+                        element -> {
+                            if (element == 1) {
+                                throw new RuntimeException("oups");
+                            }
+                            return element;
+                        })
+                .sinkTo(new DiscardingSink<>());
+        return env.getStreamGraph();
+    }
 }

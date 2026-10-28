@@ -18,111 +18,162 @@
 
 package org.apache.flink.runtime.executiongraph;
 
-import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutorServiceAdapter;
+import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.runtime.concurrent.ManuallyTriggeredScheduledExecutorService;
 import org.apache.flink.runtime.execution.ExecutionState;
-import org.apache.flink.runtime.jobgraph.JobStatus;
+import org.apache.flink.runtime.executiongraph.failover.FixedDelayRestartBackoffTimeStrategy;
+import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
+import org.apache.flink.runtime.jobgraph.DistributionPattern;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobGraphTestUtils;
 import org.apache.flink.runtime.jobgraph.JobVertex;
-import org.apache.flink.runtime.jobmanager.scheduler.CoLocationConstraint;
-import org.apache.flink.runtime.jobmanager.scheduler.SchedulerTestBase;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
-import org.apache.flink.runtime.jobmaster.slotpool.SlotProvider;
+import org.apache.flink.runtime.scheduler.DefaultSchedulerBuilder;
+import org.apache.flink.runtime.scheduler.SchedulerBase;
+import org.apache.flink.runtime.scheduler.SchedulerTestingUtils;
+import org.apache.flink.runtime.scheduler.TestingPhysicalSlot;
+import org.apache.flink.runtime.scheduler.TestingPhysicalSlotProvider;
+import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.testutils.TestingUtils;
+import org.apache.flink.testutils.executor.TestExecutorExtension;
 import org.apache.flink.util.FlinkException;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Predicate;
 
-import static org.apache.flink.runtime.jobgraph.JobStatus.FINISHED;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
+import static org.apache.flink.api.common.JobStatus.FINISHED;
+import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
+import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Additional {@link ExecutionGraph} restart tests {@link ExecutionGraphRestartTest} which
- * require the usage of a {@link SlotProvider}.
- */
-public class ExecutionGraphCoLocationRestartTest extends SchedulerTestBase {
+/** Tests that co-location constraints work as expected in the case of task restarts. */
+class ExecutionGraphCoLocationRestartTest {
 
-	private static final int NUM_TASKS = 31;
+    @RegisterExtension
+    static final TestExecutorExtension<ScheduledExecutorService> EXECUTOR_RESOURCE =
+            TestingUtils.defaultExecutorExtension();
 
-	@Test
-	public void testConstraintsAfterRestart() throws Exception {
+    @RegisterExtension
+    static final TestingComponentMainThreadExecutor.Extension MAIN_EXECUTOR_RESOURCE =
+            new TestingComponentMainThreadExecutor.Extension();
 
-		final long timeout = 5000L;
+    private final TestingComponentMainThreadExecutor mainThreadExecutor =
+            MAIN_EXECUTOR_RESOURCE.getComponentMainThreadTestExecutor();
 
-		//setting up
-		testingSlotProvider.addTaskManager(NUM_TASKS);
+    private static final int NUM_TASKS = 31;
 
-		JobVertex groupVertex = ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
-		JobVertex groupVertex2 = ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
+    @Test
+    void testConstraintsAfterRestart() throws Exception {
 
-		SlotSharingGroup sharingGroup = new SlotSharingGroup();
-		groupVertex.setSlotSharingGroup(sharingGroup);
-		groupVertex2.setSlotSharingGroup(sharingGroup);
-		groupVertex.setStrictlyCoLocatedWith(groupVertex2);
+        final long timeout = 5000L;
 
-		//initiate and schedule job
-		final ExecutionGraph eg = new ExecutionGraphTestUtils.TestingExecutionGraphBuilder(groupVertex, groupVertex2)
-			.setSlotProvider(testingSlotProvider)
-			.setRestartStrategy(
-				new TestRestartStrategy(
-					1,
-					false))
-			.allowQueuedScheduling()
-			.build();
+        JobVertex groupVertex = ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
+        JobVertex groupVertex2 = ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
+        connectNewDataSetAsInput(
+                groupVertex2,
+                groupVertex,
+                DistributionPattern.POINTWISE,
+                ResultPartitionType.PIPELINED);
 
-		// enable the queued scheduling for the slot pool
-		eg.start(ComponentMainThreadExecutorServiceAdapter.forMainThread());
+        SlotSharingGroup sharingGroup = new SlotSharingGroup();
+        groupVertex.setSlotSharingGroup(sharingGroup);
+        groupVertex2.setSlotSharingGroup(sharingGroup);
+        groupVertex.setStrictlyCoLocatedWith(groupVertex2);
 
-		assertEquals(JobStatus.CREATED, eg.getState());
+        // initiate and schedule job
+        final JobGraph jobGraph = JobGraphTestUtils.streamingJobGraph(groupVertex, groupVertex2);
 
-		eg.scheduleForExecution();
+        final ManuallyTriggeredScheduledExecutorService delayExecutor =
+                new ManuallyTriggeredScheduledExecutorService();
+        final SchedulerBase scheduler =
+                new DefaultSchedulerBuilder(
+                                jobGraph,
+                                mainThreadExecutor.getMainThreadExecutor(),
+                                EXECUTOR_RESOURCE.getExecutor())
+                        .setExecutionSlotAllocatorFactory(
+                                SchedulerTestingUtils.newSlotSharingExecutionSlotAllocatorFactory(
+                                        TestingPhysicalSlotProvider.create(
+                                                (ignored) ->
+                                                        CompletableFuture.completedFuture(
+                                                                TestingPhysicalSlot.builder()
+                                                                        .build()))))
+                        .setDelayExecutor(delayExecutor)
+                        .setRestartBackoffTimeStrategy(
+                                new FixedDelayRestartBackoffTimeStrategy
+                                                .FixedDelayRestartBackoffTimeStrategyFactory(1, 0)
+                                        .create())
+                        .build();
 
-		Predicate<AccessExecution> isDeploying = ExecutionGraphTestUtils.isInExecutionState(ExecutionState.DEPLOYING);
-		ExecutionGraphTestUtils.waitForAllExecutionsPredicate(
-			eg,
-			isDeploying,
-			timeout);
+        final ExecutionGraph eg = scheduler.getExecutionGraph();
 
-		assertEquals(JobStatus.RUNNING, eg.getState());
+        // enable the queued scheduling for the slot pool
+        assertThat(eg.getState()).isEqualTo(JobStatus.CREATED);
 
-		//sanity checks
-		validateConstraints(eg);
+        mainThreadExecutor.execute(scheduler::startScheduling);
 
-		eg.getAllExecutionVertices().iterator().next().fail(new FlinkException("Test exception"));
+        Predicate<AccessExecution> isDeploying =
+                ExecutionGraphTestUtils.isInExecutionState(ExecutionState.DEPLOYING);
+        ExecutionGraphTestUtils.waitForAllExecutionsPredicate(eg, isDeploying, timeout);
 
-		assertEquals(JobStatus.FAILING, eg.getState());
+        assertThat(eg.getState()).isEqualTo(JobStatus.RUNNING);
 
-		for (ExecutionVertex vertex : eg.getAllExecutionVertices()) {
-			vertex.getCurrentExecutionAttempt().completeCancelling();
-		}
+        // sanity checks
+        validateConstraints(eg);
 
-		// wait until we have restarted
-		ExecutionGraphTestUtils.waitUntilJobStatus(eg, JobStatus.RUNNING, timeout);
+        mainThreadExecutor.execute(
+                () -> {
+                    eg.getAllExecutionVertices()
+                            .iterator()
+                            .next()
+                            .fail(new FlinkException("Test exception"));
+                });
 
-		ExecutionGraphTestUtils.waitForAllExecutionsPredicate(
-			eg,
-			isDeploying,
-			timeout);
+        assertThat(eg.getState()).isEqualTo(JobStatus.RESTARTING);
 
-		//checking execution vertex properties
-		validateConstraints(eg);
+        // trigger registration of restartTasks(...) callback to cancelFuture before completing the
+        // cancellation. This ensures the restarting actions to be performed in main thread.
+        delayExecutor.triggerNonPeriodicScheduledTask();
 
-		ExecutionGraphTestUtils.finishAllVertices(eg);
+        mainThreadExecutor.execute(
+                () -> {
+                    for (ExecutionVertex vertex : eg.getAllExecutionVertices()) {
+                        if (vertex.getExecutionState() == ExecutionState.CANCELING) {
+                            vertex.getCurrentExecutionAttempt().completeCancelling();
+                        }
+                    }
+                });
 
-		assertThat(eg.getState(), is(FINISHED));
-	}
+        // wait until we have restarted
+        ExecutionGraphTestUtils.waitUntilJobStatus(eg, JobStatus.RUNNING, timeout);
 
-	private void validateConstraints(ExecutionGraph eg) {
+        ExecutionGraphTestUtils.waitForAllExecutionsPredicate(eg, isDeploying, timeout);
 
-		ExecutionJobVertex[] tasks = eg.getAllVertices().values().toArray(new ExecutionJobVertex[2]);
+        // checking execution vertex properties
+        validateConstraints(eg);
 
-		for (int i = 0; i < NUM_TASKS; i++) {
-			CoLocationConstraint constr1 = tasks[0].getTaskVertices()[i].getLocationConstraint();
-			CoLocationConstraint constr2 = tasks[1].getTaskVertices()[i].getLocationConstraint();
-			assertThat(constr1.isAssigned(), is(true));
-			assertThat(constr1.getLocation(), equalTo(constr2.getLocation()));
-		}
-	}
+        mainThreadExecutor.execute(
+                () -> {
+                    ExecutionGraphTestUtils.finishAllVertices(eg);
+                });
+
+        assertThat(eg.getState()).isEqualTo(FINISHED);
+    }
+
+    private void validateConstraints(ExecutionGraph eg) {
+
+        ExecutionJobVertex[] tasks =
+                eg.getAllVertices().values().toArray(new ExecutionJobVertex[2]);
+
+        for (int i = 0; i < NUM_TASKS; i++) {
+            TaskManagerLocation taskManagerLocation0 =
+                    tasks[0].getTaskVertices()[i].getCurrentAssignedResourceLocation();
+            TaskManagerLocation taskManagerLocation1 =
+                    tasks[1].getTaskVertices()[i].getCurrentAssignedResourceLocation();
+
+            assertThat(taskManagerLocation0).isEqualTo(taskManagerLocation1);
+        }
+    }
 }

@@ -28,6 +28,7 @@ import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 
 import java.io.Serializable;
 
+import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -37,61 +38,93 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  */
 public class ResultPartitionDeploymentDescriptor implements Serializable {
 
-	private static final long serialVersionUID = 6343547936086963705L;
+    private static final long serialVersionUID = 6343547936086963705L;
 
-	private final PartitionDescriptor partitionDescriptor;
+    private final PartitionDescriptor partitionDescriptor;
 
-	private final ShuffleDescriptor shuffleDescriptor;
+    private final ShuffleDescriptor shuffleDescriptor;
 
-	private final int maxParallelism;
+    private final int maxParallelism;
 
-	/** Flag whether the result partition should send scheduleOrUpdateConsumer messages. */
-	private final boolean sendScheduleOrUpdateConsumersMessage;
+    /** Parallelism of the consuming job vertices, or {@link #UNKNOWN_CONSUMER_PARALLELISM}. */
+    private final int consumerParallelism;
 
-	public ResultPartitionDeploymentDescriptor(
-			PartitionDescriptor partitionDescriptor,
-			ShuffleDescriptor shuffleDescriptor,
-			int maxParallelism,
-			boolean sendScheduleOrUpdateConsumersMessage) {
-		this.partitionDescriptor = checkNotNull(partitionDescriptor);
-		this.shuffleDescriptor = checkNotNull(shuffleDescriptor);
-		KeyGroupRangeAssignment.checkParallelismPreconditions(maxParallelism);
-		this.maxParallelism = maxParallelism;
-		this.sendScheduleOrUpdateConsumersMessage = sendScheduleOrUpdateConsumersMessage;
-	}
+    /**
+     * The consumer parallelism is not decided yet when the producer is deployed. This only happens
+     * in dynamic graphs (AdaptiveBatchScheduler), where the parallelism of a consumer vertex may be
+     * decided after its producers are deployed. Every other partition carries the actual consumer
+     * parallelism.
+     */
+    public static final int UNKNOWN_CONSUMER_PARALLELISM = -1;
 
-	public IntermediateDataSetID getResultId() {
-		return partitionDescriptor.getResultId();
-	}
+    public ResultPartitionDeploymentDescriptor(
+            PartitionDescriptor partitionDescriptor,
+            ShuffleDescriptor shuffleDescriptor,
+            int maxParallelism,
+            int consumerParallelism) {
+        this.partitionDescriptor = checkNotNull(partitionDescriptor);
+        this.shuffleDescriptor = checkNotNull(shuffleDescriptor);
+        KeyGroupRangeAssignment.checkParallelismPreconditions(maxParallelism);
+        this.maxParallelism = maxParallelism;
+        checkArgument(
+                consumerParallelism > 0 || consumerParallelism == UNKNOWN_CONSUMER_PARALLELISM,
+                "Invalid consumer parallelism %s.",
+                consumerParallelism);
+        this.consumerParallelism = consumerParallelism;
+    }
 
-	public IntermediateResultPartitionID getPartitionId() {
-		return partitionDescriptor.getPartitionId();
-	}
+    public IntermediateDataSetID getResultId() {
+        return partitionDescriptor.getResultId();
+    }
 
-	public ResultPartitionType getPartitionType() {
-		return partitionDescriptor.getPartitionType();
-	}
+    public IntermediateResultPartitionID getPartitionId() {
+        return partitionDescriptor.getPartitionId();
+    }
 
-	public int getNumberOfSubpartitions() {
-		return partitionDescriptor.getNumberOfSubpartitions();
-	}
+    /** Whether the resultPartition is a broadcast edge. */
+    public boolean isBroadcast() {
+        return partitionDescriptor.isBroadcast();
+    }
 
-	public int getMaxParallelism() {
-		return maxParallelism;
-	}
+    public ResultPartitionType getPartitionType() {
+        return partitionDescriptor.getPartitionType();
+    }
 
-	public ShuffleDescriptor getShuffleDescriptor() {
-		return shuffleDescriptor;
-	}
+    public int getTotalNumberOfPartitions() {
+        return partitionDescriptor.getTotalNumberOfPartitions();
+    }
 
-	public boolean sendScheduleOrUpdateConsumersMessage() {
-		return sendScheduleOrUpdateConsumersMessage;
-	}
+    public int getNumberOfSubpartitions() {
+        return partitionDescriptor.getNumberOfSubpartitions();
+    }
 
-	@Override
-	public String toString() {
-		return String.format("ResultPartitionDeploymentDescriptor [PartitionDescriptor: %s, "
-						+ "ShuffleDescriptor: %s]",
-			partitionDescriptor, shuffleDescriptor);
-	}
+    public boolean isNumberOfPartitionConsumerUndefined() {
+        return partitionDescriptor.isNumberOfPartitionConsumerUndefined();
+    }
+
+    public int getMaxParallelism() {
+        return maxParallelism;
+    }
+
+    /**
+     * Returns the parallelism of the job vertices consuming this partition, or {@link
+     * #UNKNOWN_CONSUMER_PARALLELISM} if it is not decided yet. Unlike {@link
+     * #getNumberOfSubpartitions()}, this is the actual consumer parallelism for every distribution
+     * pattern.
+     */
+    public int getConsumerParallelism() {
+        return consumerParallelism;
+    }
+
+    public ShuffleDescriptor getShuffleDescriptor() {
+        return shuffleDescriptor;
+    }
+
+    @Override
+    public String toString() {
+        return String.format(
+                "ResultPartitionDeploymentDescriptor [PartitionDescriptor: %s, "
+                        + "ShuffleDescriptor: %s]",
+                partitionDescriptor, shuffleDescriptor);
+    }
 }

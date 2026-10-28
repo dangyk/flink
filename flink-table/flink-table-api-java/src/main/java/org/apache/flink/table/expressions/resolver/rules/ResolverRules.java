@@ -19,49 +19,58 @@
 package org.apache.flink.table.expressions.resolver.rules;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.ApiExpression;
+import org.apache.flink.table.expressions.SqlCallExpression;
 import org.apache.flink.table.expressions.UnresolvedReferenceExpression;
+import org.apache.flink.table.types.UnresolvedDataType;
 
-/**
- * Contains instances of {@link ResolverRule}.
- */
+/** Contains instances of {@link ResolverRule}. */
 @Internal
 public final class ResolverRules {
 
-	/**
-	 * Resolves {@link UnresolvedReferenceExpression}. See {@link ReferenceResolverRule} for details.
-	 */
-	public static final ResolverRule FIELD_RESOLVE = new ReferenceResolverRule();
+    /** Resolves {@link UnresolvedDataType}. See {@link TypeResolverRule} for details. */
+    public static final ResolverRule RESOLVE_TYPE = new TypeResolverRule();
 
-	/**
-	 * Resolves call based on argument types. See {@link ResolveCallByArgumentsRule} for details.
-	 */
-	public static final ResolverRule RESOLVE_CALL_BY_ARGUMENTS = new ResolveCallByArgumentsRule();
+    /**
+     * Resolves {@link UnresolvedReferenceExpression}. See {@link ReferenceResolverRule} for
+     * details.
+     */
+    public static final ResolverRule RESOLVE_FIELD = new ReferenceResolverRule();
 
-	/**
-	 * Looks up unresolved call by name. See {@link LookupCallByNameRule} for details.
-	 */
-	public static final ResolverRule LOOKUP_CALL_BY_NAME = new LookupCallByNameRule();
+    /** Resolves {@link SqlCallExpression}s. */
+    public static final ResolverRule RESOLVE_SQL_CALL = new ResolveSqlCallRule();
 
-	/**
-	 * Concatenates over aggregations with corresponding over window. See {@link OverWindowResolverRule} for details.
-	 */
-	public static final ResolverRule OVER_WINDOWS = new OverWindowResolverRule();
+    /**
+     * Resolves call based on argument types. See {@link ResolveCallByArgumentsRule} for details.
+     */
+    public static final ResolverRule RESOLVE_CALL_BY_ARGUMENTS = new ResolveCallByArgumentsRule();
 
-	/**
-	 * Resolves '*' expressions to corresponding fields of inputs. See {@link StarReferenceFlatteningRule} for details.
-	 */
-	public static final ResolverRule FLATTEN_STAR_REFERENCE = new StarReferenceFlatteningRule();
+    /** Looks up unresolved call by name. See {@link LookupCallByNameRule} for details. */
+    public static final ResolverRule LOOKUP_CALL_BY_NAME = new LookupCallByNameRule();
 
-	/**
-	 * Resolves column functions to corresponding fields of inputs. See {@link ExpandColumnFunctionsRule} for details.
-	 */
-	public static final ResolverRule EXPAND_COLUMN_FUNCTIONS = new ExpandColumnFunctionsRule();
+    /**
+     * Concatenates over aggregations with corresponding over window. See {@link
+     * OverWindowResolverRule} for details.
+     */
+    public static final ResolverRule OVER_WINDOWS = new OverWindowResolverRule();
 
-	/**
-	 * Looks up unresolved calls of built-in functions to make them fully qualified.
-	 */
-	public static final ResolverRule QUALIFY_BUILT_IN_FUNCTIONS = new QualifyBuiltInFunctionsRule();
+    /**
+     * Resolves '*' expressions to corresponding fields of inputs. See {@link
+     * StarReferenceFlatteningRule} for details.
+     */
+    public static final ResolverRule FLATTEN_STAR_REFERENCE = new StarReferenceFlatteningRule();
 
-	private ResolverRules() {
-	}
+    /**
+     * Resolves column functions to corresponding fields of inputs. See {@link
+     * ExpandColumnFunctionsRule} for details.
+     */
+    public static final ResolverRule EXPAND_COLUMN_FUNCTIONS = new ExpandColumnFunctionsRule();
+
+    /** Looks up unresolved calls of built-in functions to make them fully qualified. */
+    public static final ResolverRule QUALIFY_BUILT_IN_FUNCTIONS = new QualifyBuiltInFunctionsRule();
+
+    /** Unwraps all {@link ApiExpression}. */
+    public static final ResolverRule UNWRAP_API_EXPRESSION = new UnwrapApiExpressionRule();
+
+    private ResolverRules() {}
 }

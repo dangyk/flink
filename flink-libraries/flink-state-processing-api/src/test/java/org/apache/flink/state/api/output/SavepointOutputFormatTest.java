@@ -19,81 +19,79 @@
 package org.apache.flink.state.api.output;
 
 import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.api.common.io.FirstAttemptInitializationContext;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.checkpoint.OperatorState;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
-import org.apache.flink.runtime.checkpoint.savepoint.Savepoint;
-import org.apache.flink.runtime.checkpoint.savepoint.SavepointV2;
+import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
 import org.apache.flink.state.api.runtime.OperatorIDGenerator;
 import org.apache.flink.state.api.runtime.SavepointLoader;
 import org.apache.flink.streaming.util.MockStreamingRuntimeContext;
 
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.util.Collections;
 
-/**
- * Test for writing output savepoint metadata.
- */
-public class SavepointOutputFormatTest {
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-	@Rule
-	public TemporaryFolder temporaryFolder = new TemporaryFolder();
+/** Test for writing output savepoint metadata. */
+class SavepointOutputFormatTest {
 
-	@Test(expected = IllegalStateException.class)
-	public void testSavepointOutputFormatOnlyWorksWithParallelismOne() throws Exception {
-		Path path = new Path(temporaryFolder.newFolder().getAbsolutePath());
-		SavepointOutputFormat format = createSavepointOutputFormat(path);
+    @TempDir private File temporaryFolder;
 
-		format.open(0, 2);
-	}
+    @Test
+    void testSavepointOutputFormatOnlyWorksWithParallelismOne() throws Exception {
+        Path path = new Path(temporaryFolder.getAbsolutePath());
+        SavepointOutputFormat format = createSavepointOutputFormat(path);
 
-	@Test
-	public void testSavepointOutputFormat() throws Exception {
-		Path path = new Path(temporaryFolder.newFolder().getAbsolutePath());
-		SavepointOutputFormat format = createSavepointOutputFormat(path);
+        assertThatThrownBy(() -> format.open(FirstAttemptInitializationContext.of(0, 2)))
+                .isInstanceOf(IllegalStateException.class);
+    }
 
-		Savepoint savepoint = createSavepoint();
+    @Test
+    void testSavepointOutputFormat() throws Exception {
+        Path path = new Path(temporaryFolder.getAbsolutePath());
+        SavepointOutputFormat format = createSavepointOutputFormat(path);
 
-		format.open(0, 1);
-		format.writeRecord(savepoint);
-		format.close();
+        CheckpointMetadata metadata = createSavepoint();
 
-		Savepoint savepointOnDisk = SavepointLoader.loadSavepoint(path.getPath());
+        format.open(FirstAttemptInitializationContext.of(0, 1));
+        format.writeRecord(metadata);
+        format.close();
 
-		Assert.assertEquals(
-			"Incorrect checkpoint id",
-			savepoint.getCheckpointId(),
-			savepointOnDisk.getCheckpointId());
+        CheckpointMetadata metadataOnDisk = SavepointLoader.loadSavepointMetadata(path.getPath());
 
-		Assert.assertEquals(
-			"Incorrect number of operator states in savepoint",
-			savepoint.getOperatorStates().size(),
-			savepointOnDisk.getOperatorStates().size());
+        assertThat(metadataOnDisk.getCheckpointId())
+                .as("Incorrect checkpoint id")
+                .isEqualTo(metadata.getCheckpointId());
 
-		Assert.assertEquals(
-			"Incorrect operator state in savepoint",
-			savepoint.getOperatorStates().iterator().next(),
-			savepointOnDisk.getOperatorStates().iterator().next());
-	}
+        assertThat(metadataOnDisk.getOperatorStates())
+                .as("Incorrect number of operator states in savepoint")
+                .hasSameSizeAs(metadata.getOperatorStates());
 
-	private SavepointV2 createSavepoint() {
-		OperatorState operatorState = new OperatorState(OperatorIDGenerator.fromUid("uid"), 1, 128);
+        assertThat(metadataOnDisk.getOperatorStates().iterator().next())
+                .as("Incorrect operator state in savepoint")
+                .isEqualTo(metadata.getOperatorStates().iterator().next());
+    }
 
-		operatorState.putState(0, new OperatorSubtaskState());
-		return new SavepointV2(0, Collections.singleton(operatorState), Collections.emptyList());
-	}
+    private CheckpointMetadata createSavepoint() {
+        OperatorState operatorState =
+                new OperatorState(null, null, OperatorIDGenerator.fromUid("uid"), 1, 128);
 
-	private SavepointOutputFormat createSavepointOutputFormat(Path path) throws Exception {
-		RuntimeContext ctx = new MockStreamingRuntimeContext(false, 1, 0);
+        operatorState.putState(0, OperatorSubtaskState.builder().build());
+        return new CheckpointMetadata(
+                0, Collections.singleton(operatorState), Collections.emptyList());
+    }
 
-		SavepointOutputFormat format = new SavepointOutputFormat(path);
-		format.setRuntimeContext(ctx);
+    private SavepointOutputFormat createSavepointOutputFormat(Path path) throws Exception {
+        RuntimeContext ctx = new MockStreamingRuntimeContext(1, 0);
 
-		return format;
-	}
+        SavepointOutputFormat format = new SavepointOutputFormat(path);
+        format.setRuntimeContext(ctx);
+
+        return format;
+    }
 }
-

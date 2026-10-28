@@ -21,127 +21,112 @@ package org.apache.flink.test.misc;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.accumulators.LongCounter;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichFlatMapFunction;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.api.java.io.DiscardingOutputFormat;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.core.fs.FileSystem;
+import org.apache.flink.api.common.serialization.SimpleStringEncoder;
+import org.apache.flink.connector.file.sink.FileSink;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
-import org.apache.flink.test.util.MiniClusterWithClientResource;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.util.Collector;
-import org.apache.flink.util.TestLogger;
+import org.apache.flink.util.TestLoggerExtension;
 
-import org.junit.ClassRule;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import java.io.File;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Tests for the system behavior in multiple corner cases
- *   - when null records are passed through the system.
- *   - when disjoint dataflows are executed
- *   - when accumulators are used chained after a non-udf operator.
+ * Tests for the system behavior in multiple corner cases - when null records are passed through the
+ * system. - when disjoint dataflows are executed - when accumulators are used chained after a
+ * non-udf operator.
  *
- * <p>The tests are bundled into one class to reuse the same test cluster. This speeds
- * up test execution, as the majority of the test time goes usually into starting/stopping the
- * test cluster.
+ * <p>The tests are bundled into one class to reuse the same test cluster. This speeds up test
+ * execution, as the majority of the test time goes usually into starting/stopping the test cluster.
  */
-@SuppressWarnings("serial")
-public class MiscellaneousIssuesITCase extends TestLogger {
+@ExtendWith(TestLoggerExtension.class)
+class MiscellaneousIssuesITCase {
 
-	@ClassRule
-	public static final MiniClusterWithClientResource MINI_CLUSTER_RESOURCE = new MiniClusterWithClientResource(
-		new MiniClusterResourceConfiguration.Builder()
-			.setNumberTaskManagers(2)
-			.setNumberSlotsPerTaskManager(3)
-			.build());
+    @RegisterExtension
+    private static final MiniClusterExtension MINI_CLUSTER_RESOURCE =
+            new MiniClusterExtension(
+                    new MiniClusterResourceConfiguration.Builder()
+                            .setNumberTaskManagers(2)
+                            .setNumberSlotsPerTaskManager(3)
+                            .build());
 
-	@Test
-	public void testNullValues() {
-		try {
-			ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-			env.setParallelism(1);
+    @TempDir private File tempDir;
 
-			DataSet<String> data = env.fromElements("hallo")
-					.map(new MapFunction<String, String>() {
-						@Override
-						public String map(String value) throws Exception {
-							return null;
-						}
-					});
-			data.writeAsText("/tmp/myTest", FileSystem.WriteMode.OVERWRITE);
+    @Test
+    void testNullValues() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
 
-			try {
-				env.execute();
-				fail("this should fail due to null values.");
-			}
-			catch (JobExecutionException e) {
-				assertNotNull(e.getCause());
-				assertTrue(e.getCause() instanceof NullPointerException);
-			}
-		}
-		catch (Exception e) {
-			e.printStackTrace();
-			fail(e.getMessage());
-		}
-	}
+        DataStream<String> data =
+                env.fromData("hallo")
+                        .map(
+                                new MapFunction<String, String>() {
+                                    @Override
+                                    public String map(String value) throws Exception {
+                                        return null;
+                                    }
+                                });
+        data.sinkTo(
+                FileSink.forRowFormat(new Path(tempDir.toURI()), new SimpleStringEncoder<String>())
+                        .build());
 
-	@Test
-	public void testDisjointDataflows() {
-		try {
-			ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-			env.setParallelism(5);
+        assertThatThrownBy(env::execute)
+                .isInstanceOf(JobExecutionException.class)
+                .hasRootCauseInstanceOf(NullPointerException.class);
+    }
 
-			// generate two different flows
-			env.generateSequence(1, 10).output(new DiscardingOutputFormat<Long>());
-			env.generateSequence(1, 10).output(new DiscardingOutputFormat<Long>());
+    @Test
+    void testDisjointDataflows() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(5);
 
-		}
-		catch (Exception e) {
-			e.printStackTrace();
-			fail(e.getMessage());
-		}
-	}
+        // generate two different flows
+        env.fromSequence(1, 10).sinkTo(new DiscardingSink<>());
+        env.fromSequence(1, 10).sinkTo(new DiscardingSink<>());
+    }
 
-	@Test
-	public void testAccumulatorsAfterNoOp() {
+    @Test
+    void testAccumulatorsAfterNoOp() throws Exception {
+        final String accName = "test_accumulator";
 
-		final String accName = "test_accumulator";
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(6);
 
-		try {
-			ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-			env.setParallelism(6);
+        env.fromSequence(1, 1000000)
+                .rebalance()
+                .flatMap(
+                        new RichFlatMapFunction<Long, Long>() {
 
-			env.generateSequence(1, 1000000)
-					.rebalance()
-					.flatMap(new RichFlatMapFunction<Long, Long>() {
+                            private LongCounter counter;
 
-						private LongCounter counter;
+                            @Override
+                            public void open(OpenContext openContext) {
+                                counter = getRuntimeContext().getLongCounter(accName);
+                            }
 
-						@Override
-						public void open(Configuration parameters) {
-							counter = getRuntimeContext().getLongCounter(accName);
-						}
+                            @Override
+                            public void flatMap(Long value, Collector<Long> out) {
+                                counter.add(1L);
+                            }
+                        })
+                .sinkTo(new DiscardingSink<>());
 
-						@Override
-						public void flatMap(Long value, Collector<Long> out) {
-							counter.add(1L);
-						}
-					})
-					.output(new DiscardingOutputFormat<Long>());
+        JobExecutionResult result = env.execute();
 
-			JobExecutionResult result = env.execute();
-
-			assertEquals(1000000L, result.getAllAccumulatorResults().get(accName));
-		}
-		catch (Exception e) {
-			e.printStackTrace();
-			fail(e.getMessage());
-		}
-	}
+        assertThat(result.getAllAccumulatorResults()).containsEntry(accName, 1000000L);
+    }
 }

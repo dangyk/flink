@@ -18,250 +18,368 @@
 
 package org.apache.flink.state.api;
 
-import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.JobSubmissionResult;
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.accumulators.IntCounter;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.api.common.time.Deadline;
 import org.apache.flink.api.common.typeinfo.Types;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.client.program.ClusterClient;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.contrib.streaming.state.RocksDBStateBackend;
-import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.state.StateBackend;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.state.api.filter.SavepointKeyFilter;
 import org.apache.flink.state.api.functions.KeyedStateReaderFunction;
+import org.apache.flink.state.api.utils.JobResultRetriever;
+import org.apache.flink.state.api.utils.SavepointTestBase;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
-import org.apache.flink.streaming.api.functions.source.SourceFunction;
-import org.apache.flink.test.util.AbstractTestBase;
-import org.apache.flink.util.AbstractID;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.streaming.util.testing.CollectingSink;
 import org.apache.flink.util.Collector;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import java.time.Duration;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
-/**
- * IT case for reading state.
- */
-public class SavepointReaderKeyedStateITCase extends AbstractTestBase {
-	private static final String uid = "stateful-operator";
+import static org.assertj.core.api.Assertions.assertThat;
 
-	private static ValueStateDescriptor<Integer> valueState = new ValueStateDescriptor<>("value", Types.INT);
+/** IT case for reading state. */
+abstract class SavepointReaderKeyedStateITCase<B extends StateBackend> extends SavepointTestBase {
+    private static final String uid = "stateful-operator";
 
-	@Test
-	public void testKeyedInputFormat() throws Exception {
-		runKeyedState(new MemoryStateBackend());
-		// Reset the cluster so we can change the
-		// state backend in the StreamEnvironment.
-		// If we don't do this the tests will fail.
-		miniClusterResource.after();
-		miniClusterResource.before();
-		runKeyedState(new RocksDBStateBackend((StateBackend) new MemoryStateBackend()));
-	}
+    private static ValueStateDescriptor<Integer> valueState =
+            new ValueStateDescriptor<>("value", Types.INT);
 
-	private void runKeyedState(StateBackend backend) throws Exception {
-		StreamExecutionEnvironment streamEnv = StreamExecutionEnvironment.getExecutionEnvironment();
-		streamEnv.setStateBackend(backend);
-		streamEnv.setParallelism(4);
+    private static final String STATE_READS_ACCUMULATOR = "stateReadsAccumulator";
 
-		streamEnv
-			.addSource(new SavepointSource())
-			.rebalance()
-			.keyBy(id -> id.key)
-			.process(new KeyedStatefulOperator())
-			.uid(uid)
-			.addSink(new DiscardingSink<>());
+    private static final List<Pojo> elements =
+            IntStream.rangeClosed(1, 10).mapToObj(i -> Pojo.of(i, i)).collect(Collectors.toList());
 
-		JobGraph jobGraph = streamEnv.getStreamGraph().getJobGraph();
+    protected abstract Tuple2<Configuration, B> getStateBackendTuple();
 
-		String path = takeSavepoint(jobGraph);
+    @Test
+    void testUserKeyedStateReader() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		ExecutionEnvironment batchEnv = ExecutionEnvironment.getExecutionEnvironment();
-		ExistingSavepoint savepoint = Savepoint.load(batchEnv, path, backend);
+        applyStatefulPipeline(env);
 
-		List<Pojo> results = savepoint
-			.readKeyedState(uid, new Reader())
-			.collect();
+        String savepointPath = takeSavepoint(env);
 
-		Set<Pojo> expected = SavepointSource.getElements();
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
 
-		Assert.assertEquals("Unexpected results from keyed state", expected, new HashSet<>(results));
-	}
+        List<Pojo> results =
+                JobResultRetriever.collect(
+                        savepoint.readKeyedState(OperatorIdentifier.forUid(uid), new Reader()));
 
-	private String takeSavepoint(JobGraph jobGraph) throws Exception {
-		SavepointSource.initializeForTest();
+        Set<Pojo> expected = new HashSet<>(elements);
 
-		ClusterClient<?> client = miniClusterResource.getClusterClient();
-		client.setDetached(true);
+        assertThat(new HashSet<>(results))
+                .as("Unexpected results from keyed state")
+                .isEqualTo(expected);
+    }
 
-		JobID jobId = jobGraph.getJobID();
+    @Test
+    void testReadKeyedStateWithExactFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		Deadline deadline = Deadline.fromNow(Duration.ofMinutes(5));
+        applyStatefulPipeline(env);
 
-		String dirPath = getTempDirPath(new AbstractID().toHexString());
+        String savepointPath = takeSavepoint(env);
 
-		try {
-			client.setDetached(true);
-			JobSubmissionResult result = client.submitJob(jobGraph, getClass().getClassLoader());
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(savepoint, SavepointKeyFilter.exact(5));
+        // Only key=5 reaches the reader and reads state.
+        assertThat(result.values).containsExactly(5);
+        assertThat(result.counter).isEqualTo(1);
+    }
 
-			boolean finished = false;
-			while (deadline.hasTimeLeft()) {
-				if (SavepointSource.isFinished()) {
-					finished = true;
+    @Test
+    void testReadKeyedStateWithMultiKeyExactFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-					break;
-				}
-			}
+        applyStatefulPipeline(env);
 
-			if (!finished) {
-				Assert.fail("Failed to initialize state within deadline");
-			}
+        String savepointPath = takeSavepoint(env);
 
-			CompletableFuture<String> path = client.triggerSavepoint(result.getJobID(), dirPath);
-			return path.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
-		} finally {
-			client.cancel(jobId);
-		}
-	}
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.exact(Set.of(3, 5, 7)));
+        assertThat(result.values).containsExactlyInAnyOrder(3, 5, 7);
+        assertThat(result.counter).isEqualTo(3);
+    }
 
-	private static class SavepointSource implements SourceFunction<Pojo> {
-		private static volatile boolean finished;
+    @Test
+    void testReadKeyedStateWithInclusiveRangeFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		private volatile boolean running = true;
+        applyStatefulPipeline(env);
 
-		private static final Pojo[] elements = {
-			Pojo.of(1, 1),
-			Pojo.of(2, 2),
-			Pojo.of(3, 3)};
+        String savepointPath = takeSavepoint(env);
 
-		@Override
-		public void run(SourceContext<Pojo> ctx) {
-			synchronized (ctx.getCheckpointLock()) {
-				for (Pojo element : elements) {
-					ctx.collect(element);
-				}
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.range(3, true, 6, true));
+        // [3, 6]: only the in-range keys reach the reader and read state.
+        assertThat(result.values).containsExactlyInAnyOrder(3, 4, 5, 6);
+        assertThat(result.counter).isEqualTo(4);
+    }
 
-				finished = true;
-			}
+    @Test
+    void testReadKeyedStateWithInclusiveLowerExclusiveUpperRangeFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-			while (running) {
-				try {
-					Thread.sleep(100);
-				} catch (InterruptedException e) {
-					// ignore
-				}
-			}
-		}
+        applyStatefulPipeline(env);
 
-		@Override
-		public void cancel() {
-			running = false;
-		}
+        String savepointPath = takeSavepoint(env);
 
-		private static void initializeForTest() {
-			finished = false;
-		}
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.range(3, true, 6, false));
+        // [3, 6): the exclusive upper bound drops key 6.
+        assertThat(result.values).containsExactlyInAnyOrder(3, 4, 5);
+        assertThat(result.counter).isEqualTo(3);
+    }
 
-		private static boolean isFinished() {
-			return finished;
-		}
+    @Test
+    void testReadKeyedStateWithExclusiveLowerInclusiveUpperRangeFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		private static Set<Pojo> getElements() {
-			return new HashSet<>(Arrays.asList(elements));
-		}
-	}
+        applyStatefulPipeline(env);
 
-	private static class KeyedStatefulOperator extends KeyedProcessFunction<Integer, Pojo, Void> {
+        String savepointPath = takeSavepoint(env);
 
-		private transient ValueState<Integer> state;
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.range(3, false, 6, true));
+        // (3, 6]: the exclusive lower bound drops key 3.
+        assertThat(result.values).containsExactlyInAnyOrder(4, 5, 6);
+        assertThat(result.counter).isEqualTo(3);
+    }
 
-		@Override
-		public void open(Configuration parameters) {
-			state = getRuntimeContext().getState(valueState);
-		}
+    @Test
+    void testReadKeyedStateWithExclusiveRangeFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		@Override
-		public void processElement(Pojo value, Context ctx, Collector<Void> out) throws Exception {
-			state.update(value.state);
+        applyStatefulPipeline(env);
 
-			value.eventTimeTimer.forEach(timer -> ctx.timerService().registerEventTimeTimer(timer));
-			value.processingTimeTimer.forEach(timer -> ctx.timerService().registerProcessingTimeTimer(timer));
-		}
-	}
+        String savepointPath = takeSavepoint(env);
 
-	private static class Reader extends KeyedStateReaderFunction<Integer, Pojo> {
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.range(3, false, 6, false));
+        // (3, 6): both bounds exclusive, dropping keys 3 and 6.
+        assertThat(result.values).containsExactlyInAnyOrder(4, 5);
+        assertThat(result.counter).isEqualTo(2);
+    }
 
-		private transient ValueState<Integer> state;
+    @Test
+    void testReadKeyedStateWithEmptyFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-		@Override
-		public void open(Configuration parameters) {
-			state = getRuntimeContext().getState(valueState);
-		}
+        applyStatefulPipeline(env);
 
-		@Override
-		public void readKey(Integer key, Context ctx, Collector<Pojo> out) throws Exception {
-			Pojo pojo = new Pojo();
-			pojo.key = key;
-			pojo.state = state.value();
-			pojo.eventTimeTimer = ctx.registeredEventTimeTimers();
-			pojo.processingTimeTimer = ctx.registeredProcessingTimeTimers();
+        String savepointPath = takeSavepoint(env);
 
-			out.collect(pojo);
-		}
-	}
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint, SavepointKeyFilter.exact(Collections.emptySet()));
+        // No key reaches the reader, so no state is read.
+        assertThat(result.values).isEmpty();
+        assertThat(result.counter).isZero();
+    }
 
-	/**
-	 * A simple pojo type.
-	 */
-	public static class Pojo {
-		public static Pojo of(Integer key, Integer state) {
-			Pojo wrapper = new Pojo();
-			wrapper.key = key;
-			wrapper.state = state;
-			wrapper.eventTimeTimer = Collections.singleton(Long.MAX_VALUE - 1);
-			wrapper.processingTimeTimer = Collections.singleton(Long.MAX_VALUE - 2);
+    @Test
+    public void testReadKeyedStateWithCustomComparatorRangeFilter() throws Exception {
+        Tuple2<Configuration, B> backendTuple = getStateBackendTuple();
+        StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(backendTuple.f0);
+        env.setParallelism(4);
 
-			return wrapper;
-		}
+        applyStatefulPipeline(env);
 
-		Integer key;
+        String savepointPath = takeSavepoint(env);
 
-		Integer state;
+        SavepointReader savepoint = SavepointReader.read(env, savepointPath, backendTuple.f1);
+        // Descending order: bounds [6, 3] are valid and cover keys 3, 4, 5, 6.
+        // Under natural order the same bounds would produce an empty range (6 > 3).
+        CountingReadResult result =
+                readKeyedStateWithCountingReader(
+                        savepoint,
+                        SavepointKeyFilter.range(
+                                6, true, 3, true, (a, b) -> Integer.compare(b, a)));
+        assertThat(result.values).containsExactlyInAnyOrder(3, 4, 5, 6);
+        assertThat(result.counter).isEqualTo(4);
+    }
 
-		Set<Long> eventTimeTimer;
+    private void applyStatefulPipeline(StreamExecutionEnvironment env) {
+        env.addSource(createSource(elements))
+                .returns(Pojo.class)
+                .rebalance()
+                .keyBy(id -> id.key)
+                .process(new KeyedStatefulOperator())
+                .uid(uid)
+                .sinkTo(new DiscardingSink<>());
+    }
 
-		Set<Long> processingTimeTimer;
+    private CountingReadResult readKeyedStateWithCountingReader(
+            SavepointReader savepoint, SavepointKeyFilter<Integer> keyFilter) throws Exception {
+        DataStream<Integer> stateValues =
+                savepoint.readKeyedState(
+                        OperatorIdentifier.forUid(uid),
+                        new CountingReader(),
+                        Types.INT,
+                        Types.INT,
+                        keyFilter);
+        CollectingSink<Integer> collectingSink = new CollectingSink<>();
+        stateValues.sinkTo(collectingSink);
+        JobExecutionResult jobResult = stateValues.getExecutionEnvironment().execute();
+        Integer counter = jobResult.getAccumulatorResult(STATE_READS_ACCUMULATOR);
+        return new CountingReadResult(
+                collectingSink.getRemainingOutput(), counter == null ? 0 : counter);
+    }
 
-		@Override
-		public boolean equals(Object o) {
-			if (this == o) {
-				return true;
-			} else if (o == null || getClass() != o.getClass()) {
-				return false;
-			}
-			Pojo pojo = (Pojo) o;
-			return Objects.equals(key, pojo.key) &&
-				Objects.equals(state, pojo.state) &&
-				Objects.equals(eventTimeTimer, pojo.eventTimeTimer) &&
-				Objects.equals(processingTimeTimer, pojo.processingTimeTimer);
-		}
+    private static class KeyedStatefulOperator extends KeyedProcessFunction<Integer, Pojo, Void> {
+        private transient ValueState<Integer> state;
 
-		@Override
-		public int hashCode() {
-			return Objects.hash(key, state, eventTimeTimer, processingTimeTimer);
-		}
-	}
+        @Override
+        public void open(OpenContext openContext) {
+            state = getRuntimeContext().getState(valueState);
+        }
+
+        @Override
+        public void processElement(Pojo value, Context ctx, Collector<Void> out) throws Exception {
+            state.update(value.state);
+
+            value.eventTimeTimer.forEach(timer -> ctx.timerService().registerEventTimeTimer(timer));
+            value.processingTimeTimer.forEach(
+                    timer -> ctx.timerService().registerProcessingTimeTimer(timer));
+        }
+    }
+
+    private static class Reader extends KeyedStateReaderFunction<Integer, Pojo> {
+
+        private transient ValueState<Integer> state;
+
+        @Override
+        public void open(OpenContext openContext) {
+            state = getRuntimeContext().getState(valueState);
+        }
+
+        @Override
+        public void readKey(Integer key, Context ctx, Collector<Pojo> out) throws Exception {
+            Pojo pojo = new Pojo();
+            pojo.key = key;
+            pojo.state = state.value();
+            pojo.eventTimeTimer = ctx.registeredEventTimeTimers();
+            pojo.processingTimeTimer = ctx.registeredProcessingTimeTimers();
+
+            out.collect(pojo);
+        }
+    }
+
+    private static class CountingReader extends KeyedStateReaderFunction<Integer, Integer> {
+
+        private transient ValueState<Integer> state;
+        private transient IntCounter counter;
+
+        @Override
+        public void open(OpenContext openContext) {
+            state = getRuntimeContext().getState(valueState);
+            counter = getRuntimeContext().getIntCounter(STATE_READS_ACCUMULATOR);
+        }
+
+        @Override
+        public void readKey(Integer key, Context ctx, Collector<Integer> out) throws Exception {
+            counter.add(1);
+            out.collect(state.value());
+        }
+    }
+
+    private static class CountingReadResult {
+        private final List<Integer> values;
+        private final int counter;
+
+        private CountingReadResult(List<Integer> values, int counter) {
+            this.values = values;
+            this.counter = counter;
+        }
+    }
+
+    /** A simple pojo type. */
+    public static class Pojo {
+        public static Pojo of(Integer key, Integer state) {
+            Pojo wrapper = new Pojo();
+            wrapper.key = key;
+            wrapper.state = state;
+            wrapper.eventTimeTimer = Collections.singleton(Long.MAX_VALUE - 1);
+            wrapper.processingTimeTimer = Collections.singleton(Long.MAX_VALUE - 2);
+
+            return wrapper;
+        }
+
+        Integer key;
+
+        Integer state;
+
+        Set<Long> eventTimeTimer;
+
+        Set<Long> processingTimeTimer;
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            } else if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            Pojo pojo = (Pojo) o;
+            return Objects.equals(key, pojo.key)
+                    && Objects.equals(state, pojo.state)
+                    && Objects.equals(eventTimeTimer, pojo.eventTimeTimer)
+                    && Objects.equals(processingTimeTimer, pojo.processingTimeTimer);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(key, state, eventTimeTimer, processingTimeTimer);
+        }
+    }
 }

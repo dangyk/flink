@@ -21,6 +21,7 @@ package org.apache.flink.runtime.state.internal;
 import org.apache.flink.api.common.state.MapState;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The peer to the {@link MapState} in the internal state type hierarchy.
@@ -32,4 +33,26 @@ import java.util.Map;
  * @param <UK> Type of the values folded into the state
  * @param <UV> Type of the value in the state
  */
-public interface InternalMapState<K, N, UK, UV> extends InternalKvState<K, N, Map<UK, UV>>, MapState<UK, UV> {}
+public interface InternalMapState<K, N, UK, UV>
+        extends InternalKvState<K, N, Map<UK, UV>>, MapState<UK, UV> {
+
+    /**
+     * Returns whether this state has no visible entries other than the excluded keys, without
+     * updating TTL timestamps or cleaning up expired entries.
+     *
+     * <p>This allows clients with buffered deletions to check emptiness without applying those
+     * deletions or invalidating active iterators. TTL decorators must override this method instead
+     * of using their ordinary, potentially mutating key iteration.
+     */
+    default boolean isEmptyExcluding(Set<?> excludedKeys) throws Exception {
+        final Iterable<UK> keys = keys();
+        if (keys != null) {
+            for (UK key : keys) {
+                if (!excludedKeys.contains(key)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+}

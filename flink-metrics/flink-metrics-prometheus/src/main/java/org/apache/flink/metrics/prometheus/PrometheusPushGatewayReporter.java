@@ -19,27 +19,24 @@
 package org.apache.flink.metrics.prometheus;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.metrics.Metric;
-import org.apache.flink.metrics.MetricConfig;
 import org.apache.flink.metrics.reporter.MetricReporter;
 import org.apache.flink.metrics.reporter.Scheduled;
-import org.apache.flink.util.AbstractID;
-import org.apache.flink.util.StringUtils;
+import org.apache.flink.util.Preconditions;
 
-import io.prometheus.client.CollectorRegistry;
+import io.prometheus.client.exporter.DefaultHttpConnectionFactory;
+import io.prometheus.client.exporter.HttpConnectionFactory;
 import io.prometheus.client.exporter.PushGateway;
 
-import java.io.IOException;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
+import javax.annotation.Nullable;
 
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.DELETE_ON_SHUTDOWN;
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.GROUPING_KEY;
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.HOST;
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.JOB_NAME;
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.PORT;
-import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterOptions.RANDOM_JOB_NAME_SUFFIX;
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Map;
 
 /**
  * {@link MetricReporter} that exports {@link Metric Metrics} via Prometheus {@link PushGateway}.
@@ -47,80 +44,82 @@ import static org.apache.flink.metrics.prometheus.PrometheusPushGatewayReporterO
 @PublicEvolving
 public class PrometheusPushGatewayReporter extends AbstractPrometheusReporter implements Scheduled {
 
-	private PushGateway pushGateway;
-	private String jobName;
-	private boolean deleteOnShutdown;
-	private Map<String, String> groupingKey;
+    private final PushGateway pushGateway;
+    private final String jobName;
+    private final Map<String, String> groupingKey;
+    private final boolean deleteOnShutdown;
+    @VisibleForTesting final URL hostUrl;
+    @VisibleForTesting final boolean basicAuthEnabled;
 
-	@Override
-	public void open(MetricConfig config) {
-		super.open(config);
+    PrometheusPushGatewayReporter(
+            URL hostUrl,
+            String jobName,
+            Map<String, String> groupingKey,
+            final boolean deleteOnShutdown,
+            @Nullable String username,
+            @Nullable String password) {
+        this.hostUrl = hostUrl;
+        this.pushGateway = new PushGateway(hostUrl);
+        if (username != null && password != null) {
+            this.pushGateway.setConnectionFactory(
+                    new JdkBasicAuthHttpConnectionFactory(username, password));
+            this.basicAuthEnabled = true;
+        } else {
+            this.basicAuthEnabled = false;
+        }
+        this.jobName = Preconditions.checkNotNull(jobName);
+        this.groupingKey = Preconditions.checkNotNull(groupingKey);
+        this.deleteOnShutdown = deleteOnShutdown;
+    }
 
-		String host = config.getString(HOST.key(), HOST.defaultValue());
-		int port = config.getInteger(PORT.key(), PORT.defaultValue());
-		String configuredJobName = config.getString(JOB_NAME.key(), JOB_NAME.defaultValue());
-		boolean randomSuffix = config.getBoolean(RANDOM_JOB_NAME_SUFFIX.key(), RANDOM_JOB_NAME_SUFFIX.defaultValue());
-		deleteOnShutdown = config.getBoolean(DELETE_ON_SHUTDOWN.key(), DELETE_ON_SHUTDOWN.defaultValue());
-		groupingKey = parseGroupingKey(config.getString(GROUPING_KEY.key(), GROUPING_KEY.defaultValue()));
+    @Override
+    public void report() {
+        try {
+            pushGateway.push(registry, jobName, groupingKey);
+        } catch (Exception e) {
+            log.warn(
+                    "Failed to push metrics to PushGateway with jobName {}, groupingKey {}.",
+                    jobName,
+                    groupingKey,
+                    e);
+        }
+    }
 
-		if (host == null || host.isEmpty() || port < 1) {
-			throw new IllegalArgumentException("Invalid host/port configuration. Host: " + host + " Port: " + port);
-		}
+    @Override
+    public void close() {
+        if (deleteOnShutdown && pushGateway != null) {
+            try {
+                pushGateway.delete(jobName, groupingKey);
+            } catch (IOException e) {
+                log.warn(
+                        "Failed to delete metrics from PushGateway with jobName {}, groupingKey {}.",
+                        jobName,
+                        groupingKey,
+                        e);
+            }
+        }
+        super.close();
+    }
 
-		if (randomSuffix) {
-			this.jobName = configuredJobName + new AbstractID();
-		} else {
-			this.jobName = configuredJobName;
-		}
+    private static final class JdkBasicAuthHttpConnectionFactory implements HttpConnectionFactory {
+        private final HttpConnectionFactory connectionFactory = new DefaultHttpConnectionFactory();
+        private final String authorizationHeader;
 
-		pushGateway = new PushGateway(host + ':' + port);
-		log.info("Configured PrometheusPushGatewayReporter with {host:{}, port:{}, jobName:{}, randomJobNameSuffix:{}, deleteOnShutdown:{}, groupingKey:{}}",
-			host, port, jobName, randomSuffix, deleteOnShutdown, groupingKey);
-	}
+        private JdkBasicAuthHttpConnectionFactory(String username, String password) {
+            // Use the JDK encoder because simpleclient's implementation requires JAXB.
+            authorizationHeader =
+                    "Basic "
+                            + Base64.getEncoder()
+                                    .encodeToString(
+                                            (username + ":" + password)
+                                                    .getBytes(StandardCharsets.UTF_8));
+        }
 
-	Map<String, String> parseGroupingKey(final String groupingKeyConfig) {
-		if (!groupingKeyConfig.isEmpty()) {
-			Map<String, String> groupingKey = new HashMap<>();
-			String[] kvs = groupingKeyConfig.split(";");
-			for (String kv : kvs) {
-				int idx = kv.indexOf("=");
-				if (idx < 0) {
-					log.warn("Invalid prometheusPushGateway groupingKey:{}, will be ignored", kv);
-					continue;
-				}
-
-				String labelKey = kv.substring(0, idx);
-				String labelValue = kv.substring(idx + 1);
-				if (StringUtils.isNullOrWhitespaceOnly(labelKey) || StringUtils.isNullOrWhitespaceOnly(labelValue)) {
-					log.warn("Invalid groupingKey {labelKey:{}, labelValue:{}} must not be empty", labelKey, labelValue);
-					continue;
-				}
-				groupingKey.put(labelKey, labelValue);
-			}
-
-			return groupingKey;
-		}
-		return Collections.emptyMap();
-	}
-
-	@Override
-	public void report() {
-		try {
-			pushGateway.push(CollectorRegistry.defaultRegistry, jobName, groupingKey);
-		} catch (Exception e) {
-			log.warn("Failed to push metrics to PushGateway with jobName {}, groupingKey {}.", jobName, groupingKey, e);
-		}
-	}
-
-	@Override
-	public void close() {
-		if (deleteOnShutdown && pushGateway != null) {
-			try {
-				pushGateway.delete(jobName, groupingKey);
-			} catch (IOException e) {
-				log.warn("Failed to delete metrics from PushGateway with jobName {}, groupingKey {}.", jobName, groupingKey, e);
-			}
-		}
-		super.close();
-	}
+        @Override
+        public HttpURLConnection create(String url) throws IOException {
+            final HttpURLConnection connection = connectionFactory.create(url);
+            connection.setRequestProperty("Authorization", authorizationHeader);
+            return connection;
+        }
+    }
 }

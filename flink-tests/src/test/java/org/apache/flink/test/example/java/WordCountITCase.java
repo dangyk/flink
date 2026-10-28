@@ -19,33 +19,39 @@
 
 package org.apache.flink.test.example.java;
 
-import org.apache.flink.examples.java.wordcount.WordCount;
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.streaming.examples.wordcount.WordCount;
 import org.apache.flink.test.testdata.WordCountData;
 import org.apache.flink.test.util.JavaProgramTestBase;
 
-/**
- * Test {@link WordCount}.
- */
-public class WordCountITCase extends JavaProgramTestBase {
+import static org.apache.flink.test.util.TestBaseUtils.compareResultsByLinesInMemory;
 
-	protected String textPath;
-	protected String resultPath;
+/** Test {@link WordCount}. */
+class WordCountITCase extends JavaProgramTestBase {
 
-	@Override
-	protected void preSubmit() throws Exception {
-		textPath = createTempFile("text.txt", WordCountData.TEXT);
-		resultPath = getTempDirPath("result");
-	}
+    protected String textPath;
+    protected String resultPath;
 
-	@Override
-	protected void postSubmit() throws Exception {
-		compareResultsByLinesInMemory(WordCountData.COUNTS, resultPath);
-	}
+    @Override
+    protected void preSubmit() throws Exception {
+        textPath = createTempFile("text.txt", WordCountData.TEXT);
+        resultPath = getTempDirPath("result");
+    }
 
-	@Override
-	protected void testProgram() throws Exception {
-		WordCount.main(new String[] {
-				"--input", textPath,
-				"--output", resultPath });
-	}
+    @Override
+    protected void postSubmit() throws Exception {
+        compareResultsByLinesInMemory(WordCountData.COUNTS_AS_TUPLES, resultPath);
+    }
+
+    @Override
+    protected JobExecutionResult testProgram() throws Exception {
+        WordCount.main(
+                new String[] {
+                    "--input", textPath,
+                    "--output", resultPath,
+                    "--execution-mode", "BATCH"
+                });
+
+        return MINI_CLUSTER_EXTENSION.getTestStreamEnvironment().getLastJobExecutionResult();
+    }
 }

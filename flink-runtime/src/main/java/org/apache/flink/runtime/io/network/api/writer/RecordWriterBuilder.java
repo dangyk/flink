@@ -18,37 +18,56 @@
 
 package org.apache.flink.runtime.io.network.api.writer;
 
-/**
- * Utility class to encapsulate the logic of building a {@link RecordWriter} instance.
- */
-public class RecordWriterBuilder {
+import org.apache.flink.configuration.NettyShuffleEnvironmentOptions;
+import org.apache.flink.core.io.IOReadableWritable;
 
-	private ChannelSelector selector = new RoundRobinChannelSelector();
+/** Utility class to encapsulate the logic of building a {@link RecordWriter} instance. */
+public class RecordWriterBuilder<T extends IOReadableWritable> {
 
-	private long timeout = -1;
+    private ChannelSelector<T> selector = new RoundRobinChannelSelector<>();
 
-	private String taskName = "test";
+    private long timeout = -1;
 
-	public RecordWriterBuilder setChannelSelector(ChannelSelector selector) {
-		this.selector = selector;
-		return this;
-	}
+    private String taskName = "test";
 
-	public RecordWriterBuilder setTimeout(long timeout) {
-		this.timeout = timeout;
-		return this;
-	}
+    private boolean enabledAdaptivePartitioner = false;
 
-	public RecordWriterBuilder setTaskName(String taskName) {
-		this.taskName = taskName;
-		return this;
-	}
+    private int maxTraverseSize =
+            NettyShuffleEnvironmentOptions.ADAPTIVE_PARTITIONER_MAX_TRAVERSE_SIZE.defaultValue();
 
-	public RecordWriter build(ResultPartitionWriter writer) {
-		if (selector.isBroadcast()) {
-			return new BroadcastRecordWriter(writer, timeout, taskName);
-		} else {
-			return new ChannelSelectorRecordWriter(writer, selector, timeout, taskName);
-		}
-	}
+    public RecordWriterBuilder<T> setChannelSelector(ChannelSelector<T> selector) {
+        this.selector = selector;
+        return this;
+    }
+
+    public RecordWriterBuilder<T> setTimeout(long timeout) {
+        this.timeout = timeout;
+        return this;
+    }
+
+    public RecordWriterBuilder<T> setTaskName(String taskName) {
+        this.taskName = taskName;
+        return this;
+    }
+
+    public RecordWriterBuilder<T> setEnabledAdaptivePartitioner(
+            boolean enabledAdaptivePartitioner) {
+        this.enabledAdaptivePartitioner = enabledAdaptivePartitioner;
+        return this;
+    }
+
+    public RecordWriterBuilder<T> setMaxTraverseSize(int maxTraverseSize) {
+        this.maxTraverseSize = maxTraverseSize;
+        return this;
+    }
+
+    public RecordWriter<T> build(ResultPartitionWriter writer) {
+        if (selector.isBroadcast()) {
+            return new BroadcastRecordWriter<>(writer, timeout, taskName);
+        }
+        if (enabledAdaptivePartitioner) {
+            return new AdaptiveLoadBasedRecordWriter<>(writer, timeout, taskName, maxTraverseSize);
+        }
+        return new ChannelSelectorRecordWriter<>(writer, selector, timeout, taskName);
+    }
 }

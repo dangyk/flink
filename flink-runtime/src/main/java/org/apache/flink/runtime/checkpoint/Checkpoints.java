@@ -20,18 +20,27 @@ package org.apache.flink.runtime.checkpoint;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.checkpoint.savepoint.Savepoint;
-import org.apache.flink.runtime.checkpoint.savepoint.SavepointSerializer;
-import org.apache.flink.runtime.checkpoint.savepoint.SavepointSerializers;
-import org.apache.flink.runtime.checkpoint.savepoint.SavepointV2;
+import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.OperatorIDPair;
+import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
+import org.apache.flink.runtime.checkpoint.metadata.MetadataSerializer;
+import org.apache.flink.runtime.checkpoint.metadata.MetadataSerializers;
+import org.apache.flink.runtime.checkpoint.metadata.MetadataV6Serializer;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
+import org.apache.flink.runtime.state.CheckpointMetadataOutputStream;
+import org.apache.flink.runtime.state.CheckpointStorage;
+import org.apache.flink.runtime.state.CheckpointStorageLoader;
+import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.CompletedCheckpointStorageLocation;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.state.StateBackendLoader;
 import org.apache.flink.runtime.state.StreamStateHandle;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.runtime.state.filesystem.RelativeFileStateHandle;
+import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
+import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
+import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 
@@ -55,282 +64,386 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * A utility class with the methods to write/load/dispose the checkpoint and savepoint metadata.
  *
  * <p>Stored checkpoint metadata files have the following format:
+ *
  * <pre>[MagicNumber (int) | Format Version (int) | Checkpoint Metadata (variable)]</pre>
  *
- * <p>The actual savepoint serialization is version-specific via the {@link SavepointSerializer}.
+ * <p>The actual savepoint serialization is version-specific via the {@link MetadataSerializer}.
+ *
+ * <p>Checkpoint metadata may reference state files through {@link RelativeFileStateHandle}s, which
+ * store only a file name. On recovery such a reference is resolved against the checkpoint's
+ * <i>exclusive directory</i>: the per-checkpoint directory that contains the {@code _metadata} file
+ * and the checkpoint's own, non-shared state files, e.g. {@code /checkpoints/<job-id>/chk-42/} (see
+ * {@link CheckpointedStateScope#EXCLUSIVE}). This yields the correct path only for files that
+ * actually live in that directory, which is why the {@code storeCheckpointMetadata} variants below
+ * differ in how they encode relative handles.
  */
 public class Checkpoints {
 
-	private static final Logger LOG = LoggerFactory.getLogger(Checkpoints.class);
+    private static final Logger LOG = LoggerFactory.getLogger(Checkpoints.class);
 
-	/** Magic number at the beginning of every checkpoint metadata file, for sanity checks. */
-	public static final int HEADER_MAGIC_NUMBER = 0x4960672d;
+    /** Magic number at the beginning of every checkpoint metadata file, for sanity checks. */
+    public static final int HEADER_MAGIC_NUMBER = 0x4960672d;
 
-	// ------------------------------------------------------------------------
-	//  Writing out checkpoint metadata
-	// ------------------------------------------------------------------------
+    // ------------------------------------------------------------------------
+    //  Writing out checkpoint metadata
+    // ------------------------------------------------------------------------
 
-	public static <T extends Savepoint> void storeCheckpointMetadata(
-			T checkpointMetadata,
-			OutputStream out) throws IOException {
+    /**
+     * Stores the checkpoint metadata with every {@link RelativeFileStateHandle} kept relative
+     * unconditionally, regardless of where its file currently lives. This is only correct if the
+     * caller guarantees that every referenced file is, or will be, located in the directory the
+     * metadata is eventually read from. The state processor API establishes that guarantee by
+     * copying the referenced files next to the new metadata (see {@code SavepointOutputFormat});
+     * everything else should use {@link #storeCheckpointMetadata(CheckpointMetadata,
+     * CheckpointMetadataOutputStream)}.
+     *
+     * <p>The deliberately different method name (rather than an overload) makes choosing this
+     * encoding an explicit decision at the call site.
+     */
+    public static void storeCheckpointMetadataWithoutExclusiveDir(
+            CheckpointMetadata checkpointMetadata, OutputStream out) throws IOException {
 
-		DataOutputStream dos = new DataOutputStream(out);
-		storeCheckpointMetadata(checkpointMetadata, dos);
-	}
+        DataOutputStream dos = new DataOutputStream(out);
+        storeCheckpointMetadataWithoutExclusiveDir(checkpointMetadata, dos);
+    }
 
-	public static <T extends Savepoint> void storeCheckpointMetadata(
-			T checkpointMetadata,
-			DataOutputStream out) throws IOException {
+    /**
+     * Stores the checkpoint metadata, letting the serializer check every {@link
+     * RelativeFileStateHandle} against the exclusive directory the stream writes into ({@link
+     * CheckpointMetadataOutputStream#getExclusiveCheckpointDir()}): a handle whose file lives in
+     * that directory keeps the relative encoding, while a handle pointing anywhere else (e.g. an
+     * SST file reused from a claimed savepoint) is persisted with its absolute path, because the
+     * relative form would be re-anchored to the wrong directory when the metadata is read back. Use
+     * this variant when writing an actual checkpoint or savepoint.
+     */
+    public static void storeCheckpointMetadata(
+            CheckpointMetadata checkpointMetadata, CheckpointMetadataOutputStream out)
+            throws IOException {
 
-		// write generic header
-		out.writeInt(HEADER_MAGIC_NUMBER);
-		out.writeInt(checkpointMetadata.getVersion());
+        DataOutputStream dos = new DataOutputStream(out);
+        storeCheckpointMetadata(
+                checkpointMetadata,
+                dos,
+                MetadataV6Serializer.INSTANCE,
+                out.getExclusiveCheckpointDir());
+    }
 
-		// write checkpoint metadata
-		SavepointSerializer<T> serializer = SavepointSerializers.getSerializer(checkpointMetadata);
-		serializer.serialize(checkpointMetadata, out);
-	}
+    /**
+     * Variant of {@link #storeCheckpointMetadataWithoutExclusiveDir(CheckpointMetadata,
+     * OutputStream)} for a {@link DataOutputStream}.
+     */
+    public static void storeCheckpointMetadataWithoutExclusiveDir(
+            CheckpointMetadata checkpointMetadata, DataOutputStream out) throws IOException {
+        storeCheckpointMetadataWithoutExclusiveDir(
+                checkpointMetadata, out, MetadataV6Serializer.INSTANCE);
+    }
 
-	// ------------------------------------------------------------------------
-	//  Reading and validating checkpoint metadata
-	// ------------------------------------------------------------------------
+    public static void storeCheckpointMetadata(
+            CheckpointMetadata checkpointMetadata,
+            DataOutputStream out,
+            @Nullable Path exclusiveDir)
+            throws IOException {
+        storeCheckpointMetadata(
+                checkpointMetadata, out, MetadataV6Serializer.INSTANCE, exclusiveDir);
+    }
 
-	public static Savepoint loadCheckpointMetadata(DataInputStream in, ClassLoader classLoader) throws IOException {
-		checkNotNull(in, "input stream");
-		checkNotNull(classLoader, "classLoader");
+    public static void storeCheckpointMetadataWithoutExclusiveDir(
+            CheckpointMetadata checkpointMetadata,
+            DataOutputStream out,
+            MetadataSerializer serializer)
+            throws IOException {
+        storeCheckpointMetadata(checkpointMetadata, out, serializer, null);
+    }
 
-		final int magicNumber = in.readInt();
+    public static void storeCheckpointMetadata(
+            CheckpointMetadata checkpointMetadata,
+            DataOutputStream out,
+            MetadataSerializer serializer,
+            @Nullable Path exclusiveDir)
+            throws IOException {
 
-		if (magicNumber == HEADER_MAGIC_NUMBER) {
-			final int version = in.readInt();
-			final SavepointSerializer<?> serializer = SavepointSerializers.getSerializer(version);
+        // write generic header
+        out.writeInt(HEADER_MAGIC_NUMBER);
 
-			if (serializer != null) {
-				return serializer.deserialize(in, classLoader);
-			}
-			else {
-				throw new IOException("Unrecognized checkpoint version number: " + version);
-			}
-		}
-		else {
-			throw new IOException("Unexpected magic number. This can have multiple reasons: " +
-					"(1) You are trying to load a Flink 1.0 savepoint, which is not supported by this " +
-					"version of Flink. (2) The file you were pointing to is not a savepoint at all. " +
-					"(3) The savepoint file has been corrupted.");
-		}
-	}
+        out.writeInt(serializer.getVersion());
+        serializer.serialize(checkpointMetadata, out, exclusiveDir);
+    }
 
-	@SuppressWarnings("deprecation")
-	public static CompletedCheckpoint loadAndValidateCheckpoint(
-			JobID jobId,
-			Map<JobVertexID, ExecutionJobVertex> tasks,
-			CompletedCheckpointStorageLocation location,
-			ClassLoader classLoader,
-			boolean allowNonRestoredState) throws IOException {
+    // ------------------------------------------------------------------------
+    //  Reading and validating checkpoint metadata
+    // ------------------------------------------------------------------------
 
-		checkNotNull(jobId, "jobId");
-		checkNotNull(tasks, "tasks");
-		checkNotNull(location, "location");
-		checkNotNull(classLoader, "classLoader");
+    public static CheckpointMetadata loadCheckpointMetadata(
+            DataInputStream in, ClassLoader classLoader, String externalPointer)
+            throws IOException {
+        checkNotNull(in, "input stream");
+        checkNotNull(classLoader, "classLoader");
 
-		final StreamStateHandle metadataHandle = location.getMetadataHandle();
-		final String checkpointPointer = location.getExternalPointer();
+        final int magicNumber = in.readInt();
 
-		// (1) load the savepoint
-		final Savepoint rawCheckpointMetadata;
-		try (InputStream in = metadataHandle.openInputStream()) {
-			DataInputStream dis = new DataInputStream(in);
-			rawCheckpointMetadata = loadCheckpointMetadata(dis, classLoader);
-		}
+        if (magicNumber == HEADER_MAGIC_NUMBER) {
+            final int version = in.readInt();
+            final MetadataSerializer serializer = MetadataSerializers.getSerializer(version);
+            return serializer.deserialize(in, classLoader, externalPointer);
+        } else {
+            throw new IOException(
+                    "Unexpected magic number. This can have multiple reasons: "
+                            + "(1) You are trying to load a Flink 1.0 savepoint, which is not supported by this "
+                            + "version of Flink. (2) The file you were pointing to is not a savepoint at all. "
+                            + "(3) The savepoint file has been corrupted.");
+        }
+    }
 
-		final Savepoint checkpointMetadata = rawCheckpointMetadata.getTaskStates() == null ?
-				rawCheckpointMetadata :
-				SavepointV2.convertToOperatorStateSavepointV2(tasks, rawCheckpointMetadata);
+    public static CompletedCheckpoint loadAndValidateCheckpoint(
+            JobID jobId,
+            Map<JobVertexID, ExecutionJobVertex> tasks,
+            CompletedCheckpointStorageLocation location,
+            ClassLoader classLoader,
+            boolean allowNonRestoredState,
+            CheckpointProperties checkpointProperties)
+            throws IOException {
 
-		// generate mapping from operator to task
-		Map<OperatorID, ExecutionJobVertex> operatorToJobVertexMapping = new HashMap<>();
-		for (ExecutionJobVertex task : tasks.values()) {
-			for (OperatorID operatorID : task.getOperatorIDs()) {
-				operatorToJobVertexMapping.put(operatorID, task);
-			}
-		}
+        checkNotNull(jobId, "jobId");
+        checkNotNull(tasks, "tasks");
+        checkNotNull(location, "location");
+        checkNotNull(classLoader, "classLoader");
 
-		// (2) validate it (parallelism, etc)
-		boolean expandedToLegacyIds = false;
+        final StreamStateHandle metadataHandle = location.getMetadataHandle();
+        final String checkpointPointer = location.getExternalPointer();
 
-		HashMap<OperatorID, OperatorState> operatorStates = new HashMap<>(checkpointMetadata.getOperatorStates().size());
-		for (OperatorState operatorState : checkpointMetadata.getOperatorStates()) {
+        // (1) load the savepoint
+        final CheckpointMetadata checkpointMetadata;
+        try (InputStream in = metadataHandle.openInputStream()) {
+            DataInputStream dis = new DataInputStream(in);
+            checkpointMetadata = loadCheckpointMetadata(dis, classLoader, checkpointPointer);
+        }
 
-			ExecutionJobVertex executionJobVertex = operatorToJobVertexMapping.get(operatorState.getOperatorID());
+        // generate mapping from operator to task
+        Map<OperatorID, ExecutionJobVertex> operatorToJobVertexMapping = new HashMap<>();
+        for (ExecutionJobVertex task : tasks.values()) {
+            for (OperatorIDPair operatorIDPair : task.getOperatorIDs()) {
+                operatorToJobVertexMapping.put(operatorIDPair.getGeneratedOperatorID(), task);
+                operatorIDPair
+                        .getUserDefinedOperatorID()
+                        .ifPresent(id -> operatorToJobVertexMapping.put(id, task));
+            }
+        }
 
-			// on the first time we can not find the execution job vertex for an id, we also consider alternative ids,
-			// for example as generated from older flink versions, to provide backwards compatibility.
-			if (executionJobVertex == null && !expandedToLegacyIds) {
-				operatorToJobVertexMapping = ExecutionJobVertex.includeAlternativeOperatorIDs(operatorToJobVertexMapping);
-				executionJobVertex = operatorToJobVertexMapping.get(operatorState.getOperatorID());
-				expandedToLegacyIds = true;
-				LOG.info("Could not find ExecutionJobVertex. Including user-defined OperatorIDs in search.");
-			}
+        // (2) validate it (parallelism, etc)
+        HashMap<OperatorID, OperatorState> operatorStates =
+                CollectionUtil.newHashMapWithExpectedSize(
+                        checkpointMetadata.getOperatorStates().size());
+        for (OperatorState operatorState : checkpointMetadata.getOperatorStates()) {
 
-			if (executionJobVertex != null) {
+            ExecutionJobVertex executionJobVertex =
+                    operatorToJobVertexMapping.get(operatorState.getOperatorID());
 
-				if (executionJobVertex.getMaxParallelism() == operatorState.getMaxParallelism()
-						|| !executionJobVertex.isMaxParallelismConfigured()) {
-					operatorStates.put(operatorState.getOperatorID(), operatorState);
-				} else {
-					String msg = String.format("Failed to rollback to checkpoint/savepoint %s. " +
-									"Max parallelism mismatch between checkpoint/savepoint state and new program. " +
-									"Cannot map operator %s with max parallelism %d to new program with " +
-									"max parallelism %d. This indicates that the program has been changed " +
-									"in a non-compatible way after the checkpoint/savepoint.",
-							checkpointMetadata,
-							operatorState.getOperatorID(),
-							operatorState.getMaxParallelism(),
-							executionJobVertex.getMaxParallelism());
+            if (executionJobVertex != null) {
 
-					throw new IllegalStateException(msg);
-				}
-			} else if (allowNonRestoredState) {
-				LOG.info("Skipping savepoint state for operator {}.", operatorState.getOperatorID());
-			} else {
-				for (OperatorSubtaskState operatorSubtaskState : operatorState.getStates()) {
-					if (operatorSubtaskState.hasState()) {
-						String msg = String.format("Failed to rollback to checkpoint/savepoint %s. " +
-										"Cannot map checkpoint/savepoint state for operator %s to the new program, " +
-										"because the operator is not available in the new program. If " +
-										"you want to allow to skip this, you can set the --allowNonRestoredState " +
-										"option on the CLI.",
-								checkpointPointer, operatorState.getOperatorID());
+                if (executionJobVertex.getMaxParallelism() == operatorState.getMaxParallelism()
+                        || executionJobVertex.canRescaleMaxParallelism(
+                                operatorState.getMaxParallelism())) {
+                    operatorStates.put(operatorState.getOperatorID(), operatorState);
+                } else {
+                    String msg =
+                            String.format(
+                                    "Failed to rollback to checkpoint/savepoint %s. "
+                                            + "Max parallelism mismatch between checkpoint/savepoint state and new program. "
+                                            + "Cannot map operator %s with max parallelism %d to new program with "
+                                            + "max parallelism %d. This indicates that the program has been changed "
+                                            + "in a non-compatible way after the checkpoint/savepoint.",
+                                    checkpointMetadata,
+                                    operatorState.getOperatorID(),
+                                    operatorState.getMaxParallelism(),
+                                    executionJobVertex.getMaxParallelism());
 
-						throw new IllegalStateException(msg);
-					}
-				}
+                    throw new IllegalStateException(msg);
+                }
+            } else if (allowNonRestoredState) {
+                LOG.info(
+                        "Skipping savepoint state for operator {}.", operatorState.getOperatorID());
+            } else {
+                if (operatorState.getCoordinatorState() != null) {
+                    throwNonRestoredStateException(
+                            checkpointPointer, operatorState.getOperatorID());
+                }
 
-				LOG.info("Skipping empty savepoint state for operator {}.", operatorState.getOperatorID());
-			}
-		}
+                for (OperatorSubtaskState operatorSubtaskState : operatorState.getStates()) {
+                    if (operatorSubtaskState.hasState()) {
+                        throwNonRestoredStateException(
+                                checkpointPointer, operatorState.getOperatorID());
+                    }
+                }
 
-		// (3) convert to checkpoint so the system can fall back to it
-		CheckpointProperties props = CheckpointProperties.forSavepoint();
+                LOG.info(
+                        "Skipping empty savepoint state for operator {}.",
+                        operatorState.getOperatorID());
+            }
+        }
 
-		return new CompletedCheckpoint(
-				jobId,
-				checkpointMetadata.getCheckpointId(),
-				0L,
-				0L,
-				operatorStates,
-				checkpointMetadata.getMasterStates(),
-				props,
-				location);
-	}
+        return new CompletedCheckpoint(
+                jobId,
+                checkpointMetadata.getCheckpointId(),
+                0L,
+                0L,
+                operatorStates,
+                checkpointMetadata.getMasterStates(),
+                checkpointProperties,
+                location,
+                null,
+                checkpointMetadata.getCheckpointProperties());
+    }
 
-	// ------------------------------------------------------------------------
-	//  Savepoint Disposal Hooks
-	// ------------------------------------------------------------------------
+    private static void throwNonRestoredStateException(
+            String checkpointPointer, OperatorID operatorId) {
+        String msg =
+                String.format(
+                        "Failed to rollback to checkpoint/savepoint %s. "
+                                + "Cannot map checkpoint/savepoint state for operator %s to the new program, "
+                                + "because the operator is not available in the new program. If "
+                                + "you want to allow to skip this, you can set the --allowNonRestoredState "
+                                + "option on the CLI.",
+                        checkpointPointer, operatorId);
 
-	public static void disposeSavepoint(
-			String pointer,
-			StateBackend stateBackend,
-			ClassLoader classLoader) throws IOException, FlinkException {
+        throw new IllegalStateException(msg);
+    }
 
-		checkNotNull(pointer, "location");
-		checkNotNull(stateBackend, "stateBackend");
-		checkNotNull(classLoader, "classLoader");
+    // ------------------------------------------------------------------------
+    //  Savepoint Disposal Hooks
+    // ------------------------------------------------------------------------
 
-		final CompletedCheckpointStorageLocation checkpointLocation = stateBackend.resolveCheckpoint(pointer);
+    public static void disposeSavepoint(
+            String pointer, CheckpointStorage checkpointStorage, ClassLoader classLoader)
+            throws IOException, FlinkException {
 
-		final StreamStateHandle metadataHandle = checkpointLocation.getMetadataHandle();
+        checkNotNull(pointer, "location");
+        checkNotNull(checkpointStorage, "stateBackend");
+        checkNotNull(classLoader, "classLoader");
 
-		// load the savepoint object (the metadata) to have all the state handles that we need
-		// to dispose of all state
-		final Savepoint savepoint;
-		try (InputStream in = metadataHandle.openInputStream();
-			DataInputStream dis = new DataInputStream(in)) {
+        final CompletedCheckpointStorageLocation checkpointLocation =
+                checkpointStorage.resolveCheckpoint(pointer);
 
-			savepoint = loadCheckpointMetadata(dis, classLoader);
-		}
+        final StreamStateHandle metadataHandle = checkpointLocation.getMetadataHandle();
 
-		Exception exception = null;
+        // load the savepoint object (the metadata) to have all the state handles that we need
+        // to dispose of all state
+        final CheckpointMetadata metadata;
+        try (InputStream in = metadataHandle.openInputStream();
+                DataInputStream dis = new DataInputStream(in)) {
 
-		// first dispose the savepoint metadata, so that the savepoint is not
-		// addressable any more even if the following disposal fails
-		try {
-			metadataHandle.discardState();
-		}
-		catch (Exception e) {
-			exception = e;
-		}
+            metadata = loadCheckpointMetadata(dis, classLoader, pointer);
+        }
 
-		// now dispose the savepoint data
-		try {
-			savepoint.dispose();
-		}
-		catch (Exception e) {
-			exception = ExceptionUtils.firstOrSuppressed(e, exception);
-		}
+        Exception exception = null;
 
-		// now dispose the location (directory, table, whatever)
-		try {
-			checkpointLocation.disposeStorageLocation();
-		}
-		catch (Exception e) {
-			exception = ExceptionUtils.firstOrSuppressed(e, exception);
-		}
+        // first dispose the savepoint metadata, so that the savepoint is not
+        // addressable any more even if the following disposal fails
+        try {
+            metadataHandle.discardState();
+        } catch (Exception e) {
+            exception = e;
+        }
 
-		// forward exceptions caught in the process
-		if (exception != null) {
-			ExceptionUtils.rethrowIOException(exception);
-		}
-	}
+        // now dispose the savepoint data
+        try {
+            metadata.dispose();
+        } catch (Exception e) {
+            exception = ExceptionUtils.firstOrSuppressed(e, exception);
+        }
 
-	public static void disposeSavepoint(
-			String pointer,
-			Configuration configuration,
-			ClassLoader classLoader,
-			@Nullable Logger logger) throws IOException, FlinkException {
+        // now dispose the location (directory, table, whatever)
+        try {
+            checkpointLocation.disposeStorageLocation();
+        } catch (Exception e) {
+            exception = ExceptionUtils.firstOrSuppressed(e, exception);
+        }
 
-		checkNotNull(pointer, "location");
-		checkNotNull(configuration, "configuration");
-		checkNotNull(classLoader, "classLoader");
+        // forward exceptions caught in the process
+        if (exception != null) {
+            ExceptionUtils.rethrowIOException(exception);
+        }
+    }
 
-		StateBackend backend = loadStateBackend(configuration, classLoader, logger);
+    public static void disposeSavepoint(
+            String pointer,
+            Configuration configuration,
+            ClassLoader classLoader,
+            @Nullable Logger logger)
+            throws IOException, FlinkException {
 
-		disposeSavepoint(pointer, backend, classLoader);
-	}
+        checkNotNull(pointer, "location");
+        checkNotNull(configuration, "configuration");
+        checkNotNull(classLoader, "classLoader");
 
-	@Nonnull
-	public static StateBackend loadStateBackend(Configuration configuration, ClassLoader classLoader, @Nullable Logger logger) {
-		if (logger != null) {
-			logger.info("Attempting to load configured state backend for savepoint disposal");
-		}
+        // An empty job configuration is utilized here because `disposeSavepoint` is intended
+        // for cluster-wide operations, which do not require job-specific configuration.
+        CheckpointStorage storage =
+                loadCheckpointStorage(new Configuration(), configuration, classLoader, logger);
 
-		StateBackend backend = null;
-		try {
-			backend = StateBackendLoader.loadStateBackendFromConfig(configuration, classLoader, null);
+        disposeSavepoint(pointer, storage, classLoader);
+    }
 
-			if (backend == null && logger != null) {
-				logger.info("No state backend configured, attempting to dispose savepoint " +
-						"with default backend (file system based)");
-			}
-		}
-		catch (Throwable t) {
-			// catches exceptions and errors (like linking errors)
-			if (logger != null) {
-				logger.info("Could not load configured state backend.");
-				logger.debug("Detailed exception:", t);
-			}
-		}
+    @Nonnull
+    public static StateBackend loadStateBackend(
+            Configuration jobConfig,
+            Configuration clusterConfig,
+            ClassLoader classLoader,
+            @Nullable Logger logger) {
+        if (logger != null) {
+            logger.info("Attempting to load configured state backend for savepoint disposal");
+        }
 
-		if (backend == null) {
-			// We use the memory state backend by default. The MemoryStateBackend is actually
-			// FileSystem-based for metadata
-			backend = new MemoryStateBackend();
-		}
-		return backend;
-	}
+        // Job level config can override the cluster level config.
+        Configuration mergedConfig = new Configuration(clusterConfig);
+        mergedConfig.addAll(jobConfig);
+        try {
+            return StateBackendLoader.loadStateBackendFromConfig(mergedConfig, classLoader, null);
+        } catch (Throwable t) {
+            // catches exceptions and errors (like linking errors)
+            if (logger != null) {
+                logger.info("Could not load configured state backend.");
+                logger.debug("Detailed exception:", t);
+            }
+            return new HashMapStateBackend();
+        }
+    }
 
-	// ------------------------------------------------------------------------
+    @Nonnull
+    public static CheckpointStorage loadCheckpointStorage(
+            Configuration jobConfig,
+            Configuration clusterConfig,
+            ClassLoader classLoader,
+            @Nullable Logger logger) {
+        StateBackend backend = loadStateBackend(jobConfig, clusterConfig, classLoader, logger);
 
-	/** This class contains only static utility methods and is not meant to be instantiated. */
-	private Checkpoints() {}
+        if (logger != null) {
+            logger.info("Attempting to load configured checkpoint storage for savepoint disposal");
+        }
+
+        CheckpointStorage checkpointStorage = null;
+        try {
+            checkpointStorage =
+                    CheckpointStorageLoader.load(
+                            null, backend, jobConfig, clusterConfig, classLoader, null);
+        } catch (Throwable t) {
+            // catches exceptions and errors (like linking errors)
+            if (logger != null) {
+                logger.info("Could not load configured state backend.");
+                logger.debug("Detailed exception:", t);
+            }
+        }
+
+        if (checkpointStorage == null) {
+            // We use the jobmanager checkpoint storage by default.
+            // The JobManagerCheckpointStorage is actually
+            // FileSystem-based for metadata
+            return new JobManagerCheckpointStorage();
+        }
+        return checkpointStorage;
+    }
+
+    // ------------------------------------------------------------------------
+
+    /** This class contains only static utility methods and is not meant to be instantiated. */
+    private Checkpoints() {}
 }

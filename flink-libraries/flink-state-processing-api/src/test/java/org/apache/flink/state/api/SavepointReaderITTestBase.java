@@ -19,288 +19,313 @@
 package org.apache.flink.state.api;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.JobSubmissionResult;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.time.Deadline;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
+import org.apache.flink.api.connector.source.ReaderOutput;
+import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.client.program.ClusterClient;
-import org.apache.flink.configuration.Configuration;
+import org.apache.flink.client.program.rest.RestClusterClient;
+import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.core.io.InputStatus;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
-import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
+import org.apache.flink.state.api.utils.JobResultRetriever;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.co.BroadcastProcessFunction;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
-import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.test.junit5.InjectClusterClient;
 import org.apache.flink.test.util.AbstractTestBase;
+import org.apache.flink.test.util.source.AbstractTestSource;
+import org.apache.flink.test.util.source.SingleSplitEnumerator;
+import org.apache.flink.test.util.source.TestSourceReader;
+import org.apache.flink.test.util.source.TestSplit;
 import org.apache.flink.util.AbstractID;
 import org.apache.flink.util.Collector;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-/**
- * IT case for reading state.
- */
-public abstract class SavepointReaderITTestBase extends AbstractTestBase {
-	static final String UID = "stateful-operator";
+import static org.apache.flink.state.api.utils.SavepointTestBase.waitForAllRunningOrSomeTerminal;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
-	static final String LIST_NAME = "list";
+/** IT case for reading state. */
+abstract class SavepointReaderITTestBase extends AbstractTestBase {
+    static final String UID = "stateful-operator";
 
-	static final String UNION_NAME = "union";
+    static final String LIST_NAME = "list";
 
-	static final String BROADCAST_NAME = "broadcast";
+    static final String UNION_NAME = "union";
 
-	private final ListStateDescriptor<Integer> list;
+    static final String BROADCAST_NAME = "broadcast";
 
-	private final ListStateDescriptor<Integer> union;
+    private final ListStateDescriptor<Integer> list;
 
-	private final MapStateDescriptor<Integer, String> broadcast;
+    private final ListStateDescriptor<Integer> union;
 
-	SavepointReaderITTestBase(
-		ListStateDescriptor<Integer> list,
-		ListStateDescriptor<Integer> union,
-		MapStateDescriptor<Integer, String> broadcast) {
+    private final MapStateDescriptor<Integer, String> broadcast;
 
-		this.list = list;
-		this.union = union;
-		this.broadcast = broadcast;
-	}
+    private RestClusterClient<?> clusterClient;
 
-	@Test
-	public void testOperatorStateInputFormat() throws Exception {
-		StreamExecutionEnvironment streamEnv = StreamExecutionEnvironment.getExecutionEnvironment();
-		streamEnv.setParallelism(4);
+    @BeforeEach
+    void setClusterClient(@InjectClusterClient RestClusterClient<?> clusterClient) {
+        this.clusterClient = clusterClient;
+    }
 
-		DataStream<Integer> data = streamEnv
-			.addSource(new SavepointSource())
-			.rebalance();
+    SavepointReaderITTestBase(
+            ListStateDescriptor<Integer> list,
+            ListStateDescriptor<Integer> union,
+            MapStateDescriptor<Integer, String> broadcast) {
 
-		data
-			.connect(data.broadcast(broadcast))
-			.process(new StatefulOperator(list, union, broadcast))
-			.uid(UID)
-			.addSink(new DiscardingSink<>());
+        this.list = list;
+        this.union = union;
+        this.broadcast = broadcast;
+    }
 
-		JobGraph jobGraph = streamEnv.getStreamGraph().getJobGraph();
+    @Test
+    void testOperatorStateInputFormat() throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(4);
 
-		String savepoint = takeSavepoint(jobGraph);
+        DataStream<Integer> data =
+                env.fromSource(
+                                new SavepointSource(),
+                                WatermarkStrategy.noWatermarks(),
+                                "SavepointSource")
+                        .rebalance();
 
-		ExecutionEnvironment batchEnv = ExecutionEnvironment.getExecutionEnvironment();
+        StatefulOperator statefulOperator = new StatefulOperator(list, union, broadcast);
+        data.connect(data.broadcast(broadcast))
+                .process(statefulOperator)
+                .uid(UID)
+                .sinkTo(new DiscardingSink<>());
 
-		verifyListState(savepoint, batchEnv);
+        JobGraph jobGraph = env.getStreamGraph().getJobGraph();
 
-		verifyUnionState(savepoint, batchEnv);
+        String savepoint = takeSavepoint(jobGraph);
 
-		verifyBroadcastState(savepoint, batchEnv);
-	}
+        verifyListState(savepoint, env);
 
-	abstract DataSet<Integer> readListState(ExistingSavepoint savepoint) throws IOException;
+        verifyUnionState(savepoint, env);
 
-	abstract DataSet<Integer> readUnionState(ExistingSavepoint savepoint) throws IOException;
+        verifyBroadcastState(savepoint, env);
+    }
 
-	abstract DataSet<Tuple2<Integer, String>> readBroadcastState(ExistingSavepoint savepoint) throws IOException;
+    abstract DataStream<Integer> readListState(SavepointReader savepoint) throws IOException;
 
-	private void verifyListState(String path, ExecutionEnvironment batchEnv) throws Exception {
-		ExistingSavepoint savepoint = Savepoint.load(batchEnv, path, new MemoryStateBackend());
-		List<Integer> listResult = readListState(savepoint).collect();
-		listResult.sort(Comparator.naturalOrder());
+    abstract DataStream<Integer> readUnionState(SavepointReader savepoint) throws IOException;
 
-		Assert.assertEquals("Unexpected elements read from list state", SavepointSource.getElements(), listResult);
-	}
+    abstract DataStream<Tuple2<Integer, String>> readBroadcastState(SavepointReader savepoint)
+            throws IOException;
 
-	private void verifyUnionState(String path, ExecutionEnvironment batchEnv) throws Exception {
-		ExistingSavepoint savepoint = Savepoint.load(batchEnv, path, new MemoryStateBackend());
-		List<Integer> unionResult = readUnionState(savepoint).collect();
-		unionResult.sort(Comparator.naturalOrder());
+    private void verifyListState(String path, StreamExecutionEnvironment env) throws Exception {
+        SavepointReader savepoint = SavepointReader.read(env, path, new HashMapStateBackend());
+        List<Integer> listResult = JobResultRetriever.collect(readListState(savepoint));
 
-		Assert.assertEquals("Unexpected elements read from union state", SavepointSource.getElements(), unionResult);
-	}
+        assertThat(listResult)
+                .as("Unexpected elements read from list state")
+                .containsExactlyInAnyOrderElementsOf(SavepointSource.getElements());
+    }
 
-	private void verifyBroadcastState(String path, ExecutionEnvironment batchEnv) throws Exception {
-		ExistingSavepoint savepoint = Savepoint.load(batchEnv, path, new MemoryStateBackend());
-		List<Tuple2<Integer, String>> broadcastResult = readBroadcastState(savepoint)
-			.collect();
-
-		List<Integer> broadcastStateKeys  = broadcastResult.
-			stream()
-			.map(entry -> entry.f0)
-			.sorted(Comparator.naturalOrder())
-			.collect(Collectors.toList());
-
-		List<String> broadcastStateValues = broadcastResult
-			.stream()
-			.map(entry -> entry.f1)
-			.sorted(Comparator.naturalOrder())
-			.collect(Collectors.toList());
-
-		Assert.assertEquals("Unexpected element in broadcast state keys", SavepointSource.getElements(), broadcastStateKeys);
-
-		Assert.assertEquals(
-			"Unexpected element in broadcast state values",
-			SavepointSource.getElements().stream().map(Object::toString).sorted().collect(Collectors.toList()),
-			broadcastStateValues
-		);
-	}
-
-	private String takeSavepoint(JobGraph jobGraph) throws Exception {
-		SavepointSource.initializeForTest();
-
-		ClusterClient<?> client = miniClusterResource.getClusterClient();
-		client.setDetached(true);
-
-		JobID jobId = jobGraph.getJobID();
-
-		Deadline deadline = Deadline.fromNow(Duration.ofMinutes(5));
-
-		String dirPath = getTempDirPath(new AbstractID().toHexString());
-
-		try {
-			client.setDetached(true);
-			JobSubmissionResult result = client.submitJob(jobGraph, SavepointReaderITCase.class.getClassLoader());
-
-			boolean finished = false;
-			while (deadline.hasTimeLeft()) {
-				if (SavepointSource.isFinished()) {
-					finished = true;
-
-					break;
-				}
-
-				try {
-					Thread.sleep(2L);
-				} catch (InterruptedException ignored) {
-					Thread.currentThread().interrupt();
-				}
-			}
-
-			if (!finished) {
-				Assert.fail("Failed to initialize state within deadline");
-			}
-
-			CompletableFuture<String> path = client.triggerSavepoint(result.getJobID(), dirPath);
-			return path.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
-		} finally {
-			client.cancel(jobId);
-		}
-	}
-
-	private static class SavepointSource implements SourceFunction<Integer> {
-		private static volatile boolean finished;
-
-		private volatile boolean running = true;
-
-		private static final Integer[] elements = {1, 2, 3};
-
-		@Override
-		public void run(SourceContext<Integer> ctx) {
-			synchronized (ctx.getCheckpointLock()) {
-				for (Integer element : elements) {
-					ctx.collect(element);
-				}
-
-				finished = true;
-			}
-
-			while (running) {
-				try {
-					Thread.sleep(100);
-				} catch (InterruptedException e) {
-					// ignore
-				}
-			}
-		}
-
-		@Override
-		public void cancel() {
-			running = false;
-		}
-
-		private static void initializeForTest() {
-			finished = false;
-		}
-
-		private static boolean isFinished() {
-			return finished;
-		}
-
-		private static List<Integer> getElements() {
-			return Arrays.asList(elements);
-		}
-	}
-
-	private static class StatefulOperator
-		extends BroadcastProcessFunction<Integer, Integer, Void>
-		implements CheckpointedFunction {
-
-		private final ListStateDescriptor<Integer> list;
-		private final ListStateDescriptor<Integer> union;
-		private final MapStateDescriptor<Integer, String> broadcast;
-
-		private List<Integer> elements;
-
-		private ListState<Integer> listState;
-
-		private ListState<Integer> unionState;
-
-		private StatefulOperator(
-			ListStateDescriptor<Integer> list,
-			ListStateDescriptor<Integer> union,
-			MapStateDescriptor<Integer, String> broadcast) {
-
-			this.list = list;
-			this.union = union;
-			this.broadcast = broadcast;
-		}
-
-		@Override
-		public void open(Configuration parameters) {
-			elements = new ArrayList<>();
-		}
-
-		@Override
-		public void processElement(Integer value, ReadOnlyContext ctx, Collector<Void> out) {
-			elements.add(value);
-		}
-
-		@Override
-		public void processBroadcastElement(Integer value, Context ctx, Collector<Void> out) throws Exception {
-			ctx.getBroadcastState(broadcast).put(value, value.toString());
-		}
-
-		@Override
-		public void snapshotState(FunctionSnapshotContext context) throws Exception {
-			listState.clear();
-
-			listState.addAll(elements);
-
-			unionState.clear();
-
-			unionState.addAll(elements);
-		}
-
-		@Override
-		public void initializeState(FunctionInitializationContext context) throws Exception {
-			listState = context.getOperatorStateStore().getListState(list);
-
-			unionState = context.getOperatorStateStore().getUnionListState(union);
-		}
-	}
+    private void verifyUnionState(String path, StreamExecutionEnvironment env) throws Exception {
+        SavepointReader savepoint = SavepointReader.read(env, path, new HashMapStateBackend());
+        List<Integer> unionResult = JobResultRetriever.collect(readUnionState(savepoint));
+
+        assertThat(unionResult)
+                .as("Unexpected elements read from union state")
+                .containsExactlyInAnyOrderElementsOf(SavepointSource.getElements());
+    }
+
+    private void verifyBroadcastState(String path, StreamExecutionEnvironment env)
+            throws Exception {
+        SavepointReader savepoint = SavepointReader.read(env, path, new HashMapStateBackend());
+        List<Tuple2<Integer, String>> broadcastResult =
+                JobResultRetriever.collect(readBroadcastState(savepoint));
+
+        List<String> expectedValues =
+                SavepointSource.getElements().stream()
+                        .map(Object::toString)
+                        .collect(Collectors.toList());
+
+        assertThat(broadcastResult)
+                .extracting(entry -> entry.f0)
+                .as("Unexpected element in broadcast state keys")
+                .containsExactlyInAnyOrderElementsOf(SavepointSource.getElements());
+
+        assertThat(broadcastResult)
+                .extracting(entry -> entry.f1)
+                .as("Unexpected element in broadcast state values")
+                .containsExactlyInAnyOrderElementsOf(expectedValues);
+    }
+
+    private String takeSavepoint(JobGraph jobGraph) throws Exception {
+        SavepointSource.initializeForTest();
+
+        JobID jobId = jobGraph.getJobID();
+
+        Deadline deadline = Deadline.fromNow(Duration.ofMinutes(5));
+
+        String dirPath = getTempDirPath(new AbstractID().toHexString());
+
+        try {
+            JobID jobID = clusterClient.submitJob(jobGraph).get();
+
+            waitForAllRunningOrSomeTerminal(jobID, clusterClient);
+            boolean finished = false;
+            while (deadline.hasTimeLeft()) {
+                if (SavepointSource.isFinished()) {
+                    finished = true;
+
+                    break;
+                }
+
+                try {
+                    Thread.sleep(2L);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            if (!finished) {
+                fail("Failed to initialize state within deadline");
+            }
+
+            CompletableFuture<String> path =
+                    clusterClient.triggerSavepoint(jobID, dirPath, SavepointFormatType.CANONICAL);
+            return path.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
+        } finally {
+            clusterClient.cancel(jobId).get();
+        }
+    }
+
+    private static class SavepointSource extends AbstractTestSource<Integer> {
+        private static volatile boolean finished;
+
+        private static final Integer[] elements = {1, 2, 3};
+
+        @Override
+        public SplitEnumerator<TestSplit, Void> createEnumerator(
+                SplitEnumeratorContext<TestSplit> enumContext) {
+            return new SingleSplitEnumerator(enumContext);
+        }
+
+        @Override
+        public TestSourceReader<Integer> createReader(SourceReaderContext readerContext) {
+            return new TestSourceReader<>(readerContext) {
+                private boolean receivedSplit = false;
+                private CompletableFuture<Void> availability = new CompletableFuture<>();
+
+                @Override
+                public void addSplits(List<TestSplit> splits) {
+                    if (!splits.isEmpty()) {
+                        receivedSplit = true;
+                        if (!availability.isDone()) {
+                            availability.complete(null);
+                        }
+                    }
+                }
+
+                @Override
+                public InputStatus pollNext(ReaderOutput<Integer> output) {
+                    if (receivedSplit) {
+                        for (Integer element : elements) {
+                            output.collect(element);
+                        }
+                        finished = true;
+                        availability = new CompletableFuture<>();
+                    }
+                    return InputStatus.NOTHING_AVAILABLE;
+                }
+
+                @Override
+                public CompletableFuture<Void> isAvailable() {
+                    return availability;
+                }
+            };
+        }
+
+        private static void initializeForTest() {
+            finished = false;
+        }
+
+        private static boolean isFinished() {
+            return finished;
+        }
+
+        private static List<Integer> getElements() {
+            return Arrays.asList(elements);
+        }
+    }
+
+    private static class StatefulOperator extends BroadcastProcessFunction<Integer, Integer, Void>
+            implements CheckpointedFunction {
+        private final ListStateDescriptor<Integer> list;
+        private final ListStateDescriptor<Integer> union;
+        private final MapStateDescriptor<Integer, String> broadcast;
+
+        private List<Integer> elements;
+
+        private ListState<Integer> listState;
+
+        private ListState<Integer> unionState;
+
+        private StatefulOperator(
+                ListStateDescriptor<Integer> list,
+                ListStateDescriptor<Integer> union,
+                MapStateDescriptor<Integer, String> broadcast) {
+
+            this.list = list;
+            this.union = union;
+            this.broadcast = broadcast;
+        }
+
+        @Override
+        public void open(OpenContext openContext) {
+            elements = new ArrayList<>();
+        }
+
+        @Override
+        public void processElement(Integer value, ReadOnlyContext ctx, Collector<Void> out) {
+            elements.add(value);
+        }
+
+        @Override
+        public void processBroadcastElement(Integer value, Context ctx, Collector<Void> out)
+                throws Exception {
+            ctx.getBroadcastState(broadcast).put(value, value.toString());
+        }
+
+        @Override
+        public void snapshotState(FunctionSnapshotContext context) throws Exception {
+            listState.update(elements);
+
+            unionState.update(elements);
+        }
+
+        @Override
+        public void initializeState(FunctionInitializationContext context) throws Exception {
+            listState = context.getOperatorStateStore().getListState(list);
+
+            unionState = context.getOperatorStateStore().getUnionListState(union);
+        }
+    }
 }

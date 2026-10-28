@@ -24,89 +24,190 @@ import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.executiongraph.utils.SimpleAckingTaskManagerGateway;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
-import org.apache.flink.runtime.jobmaster.SlotRequestId;
+import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.LocalTaskManagerLocation;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.FlinkException;
 
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
+import static java.util.stream.Collectors.reducing;
+import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Testing utility functions for the {@link SlotPool}.
- */
+/** Testing utility functions for the {@link SlotPool}. */
 public class SlotPoolUtils {
 
-	private SlotPoolUtils() {
-		throw new UnsupportedOperationException("Cannot instantiate this class.");
-	}
+    public static final Duration TIMEOUT = Duration.ofSeconds(10L);
 
-	public static CompletableFuture<PhysicalSlot> requestNewAllocatedBatchSlot(
-		SlotPool slotPool,
-		ComponentMainThreadExecutor mainThreadExecutor,
-		ResourceProfile resourceProfile) {
-		return CompletableFuture
-			.supplyAsync(() -> slotPool.requestNewAllocatedBatchSlot(new SlotRequestId(), resourceProfile), mainThreadExecutor)
-			.thenCompose(Function.identity());
-	}
+    private SlotPoolUtils() {
+        throw new UnsupportedOperationException("Cannot instantiate this class.");
+    }
 
-	public static ResourceID offerSlots(
-			SlotPoolImpl slotPool,
-			ComponentMainThreadExecutor mainThreadExecutor,
-			List<ResourceProfile> resourceProfiles) {
-		return offerSlots(
-			slotPool,
-			mainThreadExecutor,
-			resourceProfiles,
-			new SimpleAckingTaskManagerGateway());
-	}
+    public static DeclarativeSlotPoolBridge createDeclarativeSlotPoolBridge() {
+        return new DeclarativeSlotPoolBridgeBuilder().build();
+    }
 
-	public static ResourceID offerSlots(
-			SlotPoolImpl slotPool,
-			ComponentMainThreadExecutor mainThreadExecutor,
-			List<ResourceProfile> resourceProfiles,
-			TaskManagerGateway taskManagerGateway) {
-		final TaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
-		CompletableFuture.runAsync(
-			() -> {
-				slotPool.registerTaskManager(taskManagerLocation.getResourceID());
+    public static CompletableFuture<PhysicalSlot> requestNewAllocatedBatchSlot(
+            SlotPool slotPool,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            ResourceProfile resourceProfile) {
 
-				final Collection<SlotOffer> slotOffers = IntStream
-					.range(0, resourceProfiles.size())
-					.mapToObj(i -> new SlotOffer(new AllocationID(), i, resourceProfiles.get(i)))
-					.collect(Collectors.toList());
+        return CompletableFuture.supplyAsync(
+                        () ->
+                                slotPool.requestNewAllocatedBatchSlot(
+                                        PhysicalSlotRequestUtils.batchRequest(resourceProfile)),
+                        mainThreadExecutor)
+                .thenCompose(Function.identity());
+    }
 
-				final Collection<SlotOffer> acceptedOffers = slotPool.offerSlots(
-					taskManagerLocation,
-					taskManagerGateway,
-					slotOffers);
+    public static ResourceID offerSlots(
+            SlotPool slotPool,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            List<ResourceProfile> resourceProfiles) {
+        return CompletableFuture.supplyAsync(
+                        () -> offerSlotsFromMainThread(slotPool, resourceProfiles),
+                        mainThreadExecutor)
+                .join();
+    }
 
-				assertThat(acceptedOffers, is(slotOffers));
-			},
-			mainThreadExecutor
-		).join();
+    public static ResourceID tryOfferSlots(
+            SlotPool slotPool,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            List<ResourceProfile> resourceProfiles) {
+        return CompletableFuture.supplyAsync(
+                        () ->
+                                tryOfferSlotsFromMainThread(
+                                        slotPool,
+                                        resourceProfiles,
+                                        new SimpleAckingTaskManagerGateway()),
+                        mainThreadExecutor)
+                .join();
+    }
 
-		return taskManagerLocation.getResourceID();
-	}
+    public static ResourceID offerSlots(
+            SlotPool slotPool,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            List<ResourceProfile> resourceProfiles,
+            TaskManagerGateway taskManagerGateway) {
+        return CompletableFuture.supplyAsync(
+                        () ->
+                                offerSlotsFromMainThread(
+                                        slotPool, resourceProfiles, taskManagerGateway),
+                        mainThreadExecutor)
+                .join();
+    }
 
-	public static void failAllocation(SlotPoolImpl slotPool, ComponentMainThreadExecutor mainThreadExecutor, AllocationID allocationId, Exception exception) {
-		CompletableFuture.runAsync(
-			() -> slotPool.failAllocation(allocationId, exception),
-			mainThreadExecutor).join();
-	}
+    /**
+     * Offers slots directly on the slot pool. Must be called from the main thread (e.g. inside a
+     * {@code runInMainThread} block). All offered slots are expected to be accepted.
+     *
+     * @param slotPool the slot pool to offer slots to
+     * @param resourceProfiles the resource profiles of the slots to offer
+     * @return the resource ID of the registered task manager
+     */
+    public static ResourceID offerSlotsFromMainThread(
+            SlotPool slotPool, List<ResourceProfile> resourceProfiles) {
+        return offerSlotsFromMainThread(
+                slotPool, resourceProfiles, new SimpleAckingTaskManagerGateway());
+    }
 
-	public static void releaseTaskManager(SlotPoolImpl slotPool, ComponentMainThreadExecutor mainThreadExecutor, ResourceID taskManagerResourceId) {
-		CompletableFuture.runAsync(
-			() -> slotPool.releaseTaskManager(taskManagerResourceId, new FlinkException("Let's get rid of the offered slot.")),
-			mainThreadExecutor
-		).join();
-	}
+    /**
+     * Offers slots directly on the slot pool. Must be called from the main thread (e.g. inside a
+     * {@code runInMainThread} block). All offered slots are expected to be accepted.
+     *
+     * @param slotPool the slot pool to offer slots to
+     * @param resourceProfiles the resource profiles of the slots to offer
+     * @param taskManagerGateway the task manager gateway to use
+     * @return the resource ID of the registered task manager
+     */
+    public static ResourceID offerSlotsFromMainThread(
+            SlotPool slotPool,
+            List<ResourceProfile> resourceProfiles,
+            TaskManagerGateway taskManagerGateway) {
+        final TaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
+        slotPool.registerTaskManager(taskManagerLocation.getResourceID());
+
+        final Collection<SlotOffer> slotOffers =
+                IntStream.range(0, resourceProfiles.size())
+                        .mapToObj(
+                                i -> new SlotOffer(new AllocationID(), i, resourceProfiles.get(i)))
+                        .collect(Collectors.toList());
+
+        final Collection<SlotOffer> acceptedOffers =
+                slotPool.offerSlots(taskManagerLocation, taskManagerGateway, slotOffers);
+
+        assertThat(acceptedOffers).isEqualTo(slotOffers);
+
+        return taskManagerLocation.getResourceID();
+    }
+
+    /**
+     * Offers slots directly on the slot pool without asserting that all slots are accepted. Must be
+     * called from the main thread (e.g. inside a {@code runInMainThread} block).
+     *
+     * @param slotPool the slot pool to offer slots to
+     * @param resourceProfiles the resource profiles of the slots to offer
+     * @param taskManagerGateway the task manager gateway to use
+     * @return the resource ID of the registered task manager
+     */
+    public static ResourceID tryOfferSlotsFromMainThread(
+            SlotPool slotPool,
+            List<ResourceProfile> resourceProfiles,
+            TaskManagerGateway taskManagerGateway) {
+        final TaskManagerLocation taskManagerLocation = new LocalTaskManagerLocation();
+        slotPool.registerTaskManager(taskManagerLocation.getResourceID());
+
+        final Collection<SlotOffer> slotOffers =
+                IntStream.range(0, resourceProfiles.size())
+                        .mapToObj(
+                                i -> new SlotOffer(new AllocationID(), i, resourceProfiles.get(i)))
+                        .collect(Collectors.toList());
+
+        slotPool.offerSlots(taskManagerLocation, taskManagerGateway, slotOffers);
+
+        return taskManagerLocation.getResourceID();
+    }
+
+    public static void releaseTaskManager(
+            SlotPool slotPool,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            ResourceID taskManagerResourceId) {
+        CompletableFuture.runAsync(
+                        () ->
+                                slotPool.releaseTaskManager(
+                                        taskManagerResourceId,
+                                        new FlinkException("Let's get rid of the offered slot.")),
+                        mainThreadExecutor)
+                .join();
+    }
+
+    public static void notifyNotEnoughResourcesAvailable(
+            SlotPoolService slotPoolService,
+            ComponentMainThreadExecutor mainThreadExecutor,
+            Collection<ResourceRequirement> acquiredResources) {
+        CompletableFuture.runAsync(
+                        () -> slotPoolService.notifyNotEnoughResourcesAvailable(acquiredResources),
+                        mainThreadExecutor)
+                .join();
+    }
+
+    static ResourceCounter calculateResourceCounter(ResourceProfile[] resourceProfiles) {
+        final Map<ResourceProfile, Integer> resources =
+                Arrays.stream(resourceProfiles)
+                        .collect(
+                                Collectors.groupingBy(
+                                        Function.identity(), reducing(0, e -> 1, Integer::sum)));
+        final ResourceCounter increment = ResourceCounter.withResources(resources);
+        return increment;
+    }
 }

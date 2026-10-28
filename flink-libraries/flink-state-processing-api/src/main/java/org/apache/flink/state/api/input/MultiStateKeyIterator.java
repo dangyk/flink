@@ -18,73 +18,78 @@
 
 package org.apache.flink.state.api.input;
 
-import org.apache.flink.api.common.state.State;
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.state.StateDescriptor;
-import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.fs.CloseableRegistry;
+import org.apache.flink.runtime.state.KeyedStateBackend;
 import org.apache.flink.runtime.state.VoidNamespace;
-import org.apache.flink.runtime.state.VoidNamespaceSerializer;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.Preconditions;
 
+import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * An iterator for reading all keys in a state backend across multiple partitioned states.
  *
- * <p>To read unique keys across all partitioned states callers must invoke {@link MultiStateKeyIterator#remove}.
+ * <p>Uses {@link KeyedStateBackend#getKeysAndKeyGroups} rather than {@link
+ * KeyedStateBackend#getKeys(List, Object)}, because the State Processing API can read state whose
+ * key class is missing from the classpath, deserializing the key into a substitute representation
+ * instead of failing (see {@code CustomRestoreSerializerFactory}). Such a substituted key's {@code
+ * hashCode()} is not guaranteed to reproduce the original, so the key-group it was physically
+ * written under must be carried alongside it rather than recomputed from the key.
  *
  * @param <K> Type of the key by which state is keyed.
  */
-final class MultiStateKeyIterator<K> implements Iterator<K> {
-	private final List<? extends StateDescriptor<?, ?>> descriptors;
+@Internal
+public final class MultiStateKeyIterator<K> implements CloseableIterator<Tuple2<K, Integer>> {
+    private final List<? extends StateDescriptor<?, ?>> descriptors;
 
-	private final AbstractKeyedStateBackend<K> backend;
+    private final Iterator<Tuple2<K, Integer>> iterator;
 
-	private final Iterator<K> internal;
+    private final CloseableRegistry registry;
 
-	private K currentKey;
+    public MultiStateKeyIterator(
+            List<? extends StateDescriptor<?, ?>> descriptors, KeyedStateBackend<K> backend) {
 
-	MultiStateKeyIterator(List<? extends StateDescriptor<?, ?>> descriptors, AbstractKeyedStateBackend<K> backend) {
-		this.descriptors = Preconditions.checkNotNull(descriptors);
+        this.descriptors = Preconditions.checkNotNull(descriptors);
+        Preconditions.checkNotNull(backend);
+        registry = new CloseableRegistry();
+        Stream<Tuple2<K, Integer>> stream =
+                backend.getKeysAndKeyGroups(
+                        this.descriptors.stream()
+                                .map(StateDescriptor::getName)
+                                .collect(Collectors.toList()),
+                        VoidNamespace.INSTANCE);
+        try {
+            registry.registerCloseable(stream::close);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read keys from configured StateBackend", e);
+        }
+        iterator = stream.iterator();
+    }
 
-		this.backend = Preconditions.checkNotNull(backend);
+    @Override
+    public boolean hasNext() {
+        return iterator.hasNext();
+    }
 
-		this.internal = descriptors
-			.stream()
-			.flatMap(descriptor -> backend.getKeys(descriptor.getName(), VoidNamespace.INSTANCE))
-			.iterator();
-	}
+    @Override
+    public Tuple2<K, Integer> next() {
+        if (!hasNext()) {
+            throw new NoSuchElementException();
+        } else {
+            return iterator.next();
+        }
+    }
 
-	@Override
-	public boolean hasNext() {
-		return internal.hasNext();
-	}
-
-	@Override
-	public K next() {
-		currentKey = internal.next();
-		return currentKey;
-	}
-
-	/** Removes the current key from <b>ALL</b> known states in the state backend. */
-	@Override
-	public void remove() {
-		if (currentKey == null) {
-			return;
-		}
-
-		for (StateDescriptor<?, ?> descriptor : descriptors) {
-			try {
-				State state = backend.getPartitionedState(
-					VoidNamespace.INSTANCE,
-					VoidNamespaceSerializer.INSTANCE,
-					descriptor);
-
-				state.clear();
-			} catch (Exception e) {
-				throw new RuntimeException("Failed to drop partitioned state from state backend", e);
-			}
-		}
-	}
+    @Override
+    public void close() throws Exception {
+        registry.close();
+    }
 }
-

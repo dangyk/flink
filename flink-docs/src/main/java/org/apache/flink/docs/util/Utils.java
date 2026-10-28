@@ -18,23 +18,33 @@
 
 package org.apache.flink.docs.util;
 
-/**
- * Contains various shared utility functions.
- */
+import java.io.File;
+
+/** Contains various shared utility functions. */
 public enum Utils {
-	;
+    ;
 
-	/**
-	 * Placeholder that is used to prevent certain sections from being escaped. We don't need a sophisticated value
-	 * but only something that won't show up in config options.
-	 */
-	private static final String TEMPORARY_PLACEHOLDER = "superRandomTemporaryPlaceholder";
+    /**
+     * Placeholder that is used to prevent certain sections from being escaped. We don't need a
+     * sophisticated value but only something that won't show up in config options.
+     */
+    private static final String TEMPORARY_PLACEHOLDER = "superRandomTemporaryPlaceholder";
 
-	public static String escapeCharacters(String value) {
-		return value
-			.replaceAll("<wbr>", TEMPORARY_PLACEHOLDER)
-			.replaceAll("<", "&lt;")
-			.replaceAll(">", "&gt;")
-			.replaceAll(TEMPORARY_PLACEHOLDER, "<wbr>");
-	}
+    public static String escapeCharacters(String value) {
+        return value.replaceAll("<wbr>", TEMPORARY_PLACEHOLDER)
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll(TEMPORARY_PLACEHOLDER, "<wbr>");
+    }
+
+    public static String getProjectRootDir() {
+        final String dirFromProperty = System.getProperty("rootDir");
+        if (dirFromProperty != null) {
+            return dirFromProperty;
+        }
+
+        // to make this work in the IDE use a default fallback
+        final String currentDir = System.getProperty("user.dir");
+        return new File(currentDir).getParent();
+    }
 }

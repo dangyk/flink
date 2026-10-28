@@ -34,89 +34,116 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Ordered {@link StreamElementQueue} implementation. The ordered stream element queue provides
- * asynchronous results in the order in which the {@link StreamElementQueueEntry} have been added
- * to the queue. Thus, even if the completion order can be arbitrary, the output order strictly
- * follows the insertion order (element cannot overtake each other).
+ * asynchronous results in the order in which the {@link StreamElementQueueEntry} have been added to
+ * the queue. Thus, even if the completion order can be arbitrary, the output order strictly follows
+ * the insertion order (element cannot overtake each other).
  */
 @Internal
 public final class OrderedStreamElementQueue<OUT> implements StreamElementQueue<OUT> {
 
-	private static final Logger LOG = LoggerFactory.getLogger(OrderedStreamElementQueue.class);
+    private static final Logger LOG = LoggerFactory.getLogger(OrderedStreamElementQueue.class);
 
-	/** Capacity of this queue. */
-	private final int capacity;
+    /** Capacity of this queue. */
+    private final int capacity;
 
-	/** Queue for the inserted StreamElementQueueEntries. */
-	private final Queue<StreamElementQueueEntry<OUT>> queue;
+    /** Queue for the inserted StreamElementQueueEntries. */
+    private final Queue<StreamElementQueueEntry<OUT>> queue;
 
-	public OrderedStreamElementQueue(int capacity) {
-		Preconditions.checkArgument(capacity > 0, "The capacity must be larger than 0.");
+    private final AvailabilityHelper availabilityHelper = new AvailabilityHelper();
 
-		this.capacity = capacity;
-		this.queue = new ArrayDeque<>(capacity);
-	}
+    public OrderedStreamElementQueue(int capacity) {
+        Preconditions.checkArgument(capacity > 0, "The capacity must be larger than 0.");
 
-	@Override
-	public boolean hasCompletedElements() {
-		return !queue.isEmpty() && queue.peek().isDone();
-	}
+        this.capacity = capacity;
+        this.queue = new ArrayDeque<>(capacity);
+        this.availabilityHelper.resetAvailable();
+    }
 
-	@Override
-	public void emitCompletedElement(TimestampedCollector<OUT> output) {
-		if (hasCompletedElements()) {
-			final StreamElementQueueEntry<OUT> head = queue.poll();
-			head.emitResult(output);
-		}
-	}
+    @Override
+    public boolean hasCompletedElements() {
+        return !queue.isEmpty() && queue.peek().isDone();
+    }
 
-	@Override
-	public List<StreamElement> values() {
-		List<StreamElement> list = new ArrayList<>(this.queue.size());
-		for (StreamElementQueueEntry e : queue) {
-			list.add(e.getInputElement());
-		}
-		return list;
-	}
+    @Override
+    public void emitCompletedElement(TimestampedCollector<OUT> output) {
+        if (hasCompletedElements()) {
+            boolean isFullBefore = isFull();
+            final StreamElementQueueEntry<OUT> head = queue.poll();
+            head.emitResult(output);
+            if (isFullBefore && !isFull()) {
+                availabilityHelper.getUnavailableToResetAvailable().complete(null);
+            }
+        }
+    }
 
-	@Override
-	public boolean isEmpty() {
-		return queue.isEmpty();
-	}
+    @Override
+    public List<StreamElement> values() {
+        List<StreamElement> list = new ArrayList<>(this.queue.size());
+        for (StreamElementQueueEntry e : queue) {
+            list.add(e.getInputElement());
+        }
+        return list;
+    }
 
-	@Override
-	public int size() {
-		return queue.size();
-	}
+    @Override
+    public boolean isEmpty() {
+        return queue.isEmpty();
+    }
 
-	@Override
-	public Optional<ResultFuture<OUT>> tryPut(StreamElement streamElement) {
-		if (queue.size() < capacity) {
-			StreamElementQueueEntry<OUT> queueEntry = createEntry(streamElement);
+    @Override
+    public int size() {
+        return queue.size();
+    }
 
-			queue.add(queueEntry);
+    @Override
+    public Optional<ResultFuture<OUT>> tryPut(StreamElement streamElement) {
+        if (!isFull()) {
+            StreamElementQueueEntry<OUT> queueEntry = createEntry(streamElement);
 
-			LOG.debug("Put element into ordered stream element queue. New filling degree " +
-				"({}/{}).", queue.size(), capacity);
+            queue.add(queueEntry);
 
-			return Optional.of(queueEntry);
-		} else {
-			LOG.debug("Failed to put element into ordered stream element queue because it " +
-				"was full ({}/{}).", queue.size(), capacity);
+            LOG.debug(
+                    "Put element into ordered stream element queue. New filling degree "
+                            + "({}/{}).",
+                    queue.size(),
+                    capacity);
 
-			return Optional.empty();
-		}
-	}
+            if (isFull()) {
+                availabilityHelper.resetUnavailable();
+            }
 
-	private StreamElementQueueEntry<OUT> createEntry(StreamElement streamElement) {
-		if (streamElement.isRecord()) {
-			return new StreamRecordQueueEntry<>((StreamRecord<?>) streamElement);
-		}
-		if (streamElement.isWatermark()) {
-			return new WatermarkQueueEntry<>((Watermark) streamElement);
-		}
-		throw new UnsupportedOperationException("Cannot enqueue " + streamElement);
-	}
+            return Optional.of(queueEntry);
+        } else {
+            LOG.debug(
+                    "Failed to put element into ordered stream element queue because it "
+                            + "was full ({}/{}).",
+                    queue.size(),
+                    capacity);
+
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public CompletableFuture<?> getAvailableFuture() {
+        return availabilityHelper.getAvailableFuture();
+    }
+
+    private boolean isFull() {
+        return queue.size() >= capacity;
+    }
+
+    private StreamElementQueueEntry<OUT> createEntry(StreamElement streamElement) {
+        if (streamElement.isRecord()) {
+            return new StreamRecordQueueEntry<>((StreamRecord<?>) streamElement);
+        }
+        if (streamElement.isWatermark()) {
+            return new WatermarkQueueEntry<>((Watermark) streamElement);
+        }
+        throw new UnsupportedOperationException("Cannot enqueue " + streamElement);
+    }
 }
